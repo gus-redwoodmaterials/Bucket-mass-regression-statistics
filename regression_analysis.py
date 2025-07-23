@@ -1,11 +1,11 @@
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 import pandas as pd
 import numpy as np
 import pytz
 import os
 import sys
-from scipy.signal import find_peaks
 from scipy.stats import pearsonr
 
 from dateutil.parser import parse
@@ -89,10 +89,8 @@ def run():
         df.to_csv(csv_path, index=False)
         print("Data cached successfully!")
 
-    print(f"\nData Info:")
-    print(f"   Columns: {df.columns.tolist()}")
-    print(f"   Shape: {df.shape}")
-    print(f"   Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+    # Filter out negative Hz values
+    df.loc[df["infeed_hz_actual"] < 0, "infeed_hz_actual"] = np.nan
 
     # Print data summary
     print("\nData Summary:")
@@ -141,41 +139,43 @@ def run():
         print("\n🔬 Performing Residual Correlation Analysis...")
         perform_residual_analysis(df)
 
+        # Add 3D correlation analysis
+        print("\n📊 Performing 3D Correlation Analysis...")
+        create_3d_analysis_plot(df)
+
     return df
 
 
-def detect_conveyor_peaks(hz_signal, timestamps):
+def calculate_average_feed_rate(hz_signal, window_seconds=60):
     """
-    Detect peaks in the alternating conveyor signal to determine feed rate
+    Calculate moving average feed rate using a boxcar filter
+    This accounts for time spent at each speed, giving a true effective feed rate
     """
-    # Remove NaN values
+    # Remove NaN values but keep track of original indices
     valid_mask = ~np.isnan(hz_signal)
-    clean_signal = hz_signal[valid_mask]
-    clean_times = timestamps[valid_mask]
 
-    if len(clean_signal) < 10:
-        print("   ⚠️  Not enough valid conveyor data for peak detection")
-        return None, None, None
+    if valid_mask.sum() < 10:
+        print("   ⚠️  Not enough valid conveyor data for moving average")
+        return None
 
-    # Find peaks in the signal
-    # Use prominence to find significant peaks in the alternating signal
-    peaks, properties = find_peaks(clean_signal, prominence=np.std(clean_signal) * 0.5, distance=10)
+    # For 3-second data, calculate window size in data points
+    window_size = max(1, window_seconds // 3)  # Convert seconds to data points
 
-    if len(peaks) == 0:
-        print("   ⚠️  No peaks detected in conveyor signal")
-        return None, None, None
+    # Create a copy of the signal with NaN values filled using forward/backward fill
+    clean_signal = pd.Series(hz_signal).fillna(method="ffill").fillna(method="bfill").values
 
-    peak_values = clean_signal[peaks]
-    peak_times = clean_times.iloc[peaks]
-
-    # Calculate rolling average of peak heights (feed rate proxy)
-    window_size = min(5, len(peak_values))
-    if len(peak_values) >= window_size:
-        peak_avg = pd.Series(peak_values).rolling(window=window_size, center=True).mean()
+    # Apply moving average (boxcar filter)
+    if len(clean_signal) >= window_size:
+        # Use pandas rolling mean for clean handling of edges
+        feed_rate_avg = pd.Series(clean_signal).rolling(window=window_size, center=True, min_periods=1).mean()
     else:
-        peak_avg = pd.Series(peak_values)
+        # If not enough data for window, just return the original signal
+        feed_rate_avg = pd.Series(clean_signal)
 
-    return peak_times, peak_values, peak_avg
+    print(f"   📊 Applied {window_seconds}s moving average filter ({window_size} data points)")
+    print(f"   📊 Feed rate range: {feed_rate_avg.min():.2f} - {feed_rate_avg.max():.2f} Hz")
+
+    return feed_rate_avg.values
 
 
 def perform_residual_analysis(df):
@@ -192,15 +192,15 @@ def perform_residual_analysis(df):
 
     print("   🔍 Analyzing actual conveyor signal...")
 
-    # Detect peaks in conveyor signal
-    peak_times, peak_values, peak_avg = detect_conveyor_peaks(df["infeed_hz_actual"], df["timestamp"])
+    # Calculate moving average feed rate
+    feed_rate_avg = calculate_average_feed_rate(df["infeed_hz_actual"], window_seconds=60)
 
-    if peak_times is None:
+    if feed_rate_avg is None:
         return
 
-    print(f"   ✅ Detected {len(peak_values)} peaks in conveyor signal")
+    print("   ✅ Calculated moving average feed rate")
     print(
-        f"   📊 Peak values: Min={np.min(peak_values):.2f}, Max={np.max(peak_values):.2f}, Mean={np.mean(peak_values):.2f}"
+        f"   📊 Feed rate values: Min={np.min(feed_rate_avg):.2f}, Max={np.max(feed_rate_avg):.2f}, Mean={np.mean(feed_rate_avg):.2f}"
     )
 
     # Calculate residual statistics
@@ -213,19 +213,11 @@ def perform_residual_analysis(df):
     std_resid = residuals.std()
     high_resid_threshold = mean_resid + std_resid
 
-    # Interpolate peak feed rate to match residual timestamps
+    # Use feed rate directly - no interpolation needed since it's already aligned with timestamps
     df_clean = df.dropna(subset=["bucket_mass_resid", "timestamp"])
 
-    if len(peak_times) > 1:
-        # Interpolate peak values to all timestamps
-        feed_rate_interp = np.interp(
-            df_clean["timestamp"].astype(int),
-            peak_times.astype(int),
-            peak_avg.fillna(method="ffill").fillna(method="bfill"),
-        )
-    else:
-        print("   ⚠️  Not enough peaks for interpolation")
-        return
+    # Extract corresponding feed rates for the clean data
+    feed_rate_interp = feed_rate_avg[df_clean.index]
 
     # Categorize feed rates
     feed_rate_median = np.median(feed_rate_interp)
@@ -267,19 +259,22 @@ def perform_residual_analysis(df):
         print(
             f"   High residuals during LOW feed:  {high_resid_low_feed}/{np.sum(low_feed_mask)} ({100 * high_resid_low_feed / np.sum(low_feed_mask):.1f}%)"
         )
-
-        if high_resid_high_feed > high_resid_low_feed * 1.5:
+        # What is this doing too?
+        if high_resid_high_feed > high_resid_low_feed * 2:
             print("   🔴 Estimator performs WORSE during HIGH feed rates")
-        elif high_resid_low_feed > high_resid_high_feed * 1.5:
+        elif high_resid_low_feed > high_resid_high_feed * 2:
             print("   🔴 Estimator performs WORSE during LOW feed rates")
         else:
             print("   ✅ No clear feed rate bias in estimator performance")
 
     # Create analysis plots
-    create_analysis_plots(df_clean, feed_rate_interp, peak_times, peak_values, high_resid_threshold)
+    create_analysis_plots(df_clean, feed_rate_interp, df["timestamp"], df["infeed_hz_actual"], high_resid_threshold)
+
+    # Create moving average visualization plot
+    create_moving_average_plot(df, feed_rate_avg)
 
 
-def create_analysis_plots(df, feed_rate_interp, peak_times, peak_values, high_resid_threshold):
+def create_analysis_plots(df, feed_rate_interp, timestamps, raw_hz_signal, high_resid_threshold):
     """
     Create plots for residual correlation analysis
     """
@@ -289,10 +284,10 @@ def create_analysis_plots(df, feed_rate_interp, peak_times, peak_values, high_re
     plt.figure(figsize=(15, 10))
 
     plt.subplot(3, 1, 1)
-    plt.plot(df["timestamp"], df["infeed_hz_actual"], color="blue", alpha=0.7, label="Actual Conveyor Hz")
-    plt.scatter(peak_times, peak_values, color="red", s=30, zorder=5, label="Detected Peaks")
+    plt.plot(timestamps, raw_hz_signal, color="lightblue", alpha=0.7, label="Raw Conveyor Hz")
+    plt.plot(df["timestamp"], feed_rate_interp, color="orange", linewidth=2, label="Moving Average Feed Rate")
     plt.ylabel("Conveyor Hz")
-    plt.title("Actual Conveyor Signal with Peak Detection")
+    plt.title("Actual Conveyor Signal with Moving Average Feed Rate")
     plt.legend()
     plt.grid(True, alpha=0.3)
 
@@ -325,6 +320,185 @@ def create_analysis_plots(df, feed_rate_interp, peak_times, peak_values, high_re
 
     plt.tight_layout()
     plt.show()
+
+
+def create_moving_average_plot(df, feed_rate_avg):
+    """
+    Create a plot to visualize the moving average feed rate calculation
+    """
+    plt.figure(figsize=(15, 8))
+
+    # Plot 1: Original signal with moving average
+    plt.subplot(2, 1, 1)
+    plt.plot(
+        df["timestamp"], df["infeed_hz_actual"], color="lightblue", alpha=0.7, linewidth=1, label="Raw Conveyor Hz"
+    )
+    plt.plot(df["timestamp"], feed_rate_avg, color="orange", linewidth=2, alpha=0.8, label="Moving Average Feed Rate")
+    plt.ylabel("Conveyor Hz")
+    plt.title("Moving Average Feed Rate Calculation")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # Plot 2: Zoom in on a section to see moving average detail
+    # Take middle 20% of the data for detailed view
+    mid_start = int(len(df) * 0.4)
+    mid_end = int(len(df) * 0.6)
+    df_zoom = df.iloc[mid_start:mid_end]
+    feed_rate_zoom = feed_rate_avg[mid_start:mid_end]
+
+    plt.subplot(2, 1, 2)
+    plt.plot(
+        df_zoom["timestamp"],
+        df_zoom["infeed_hz_actual"],
+        color="lightblue",
+        alpha=0.7,
+        linewidth=1,
+        label="Raw Conveyor Hz",
+    )
+    plt.plot(
+        df_zoom["timestamp"], feed_rate_zoom, color="orange", linewidth=2, alpha=0.8, label="Moving Average Feed Rate"
+    )
+    plt.ylabel("Conveyor Hz")
+    plt.xlabel("Time")
+    plt.title("Detailed View: How Moving Average Smooths Feed Rate Variations")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Print some stats about the moving average
+    print("\n   📊 MOVING AVERAGE SUMMARY:")
+    print(f"   Raw signal range: {df['infeed_hz_actual'].min():.2f} - {df['infeed_hz_actual'].max():.2f} Hz")
+    print(f"   Moving average range: {np.min(feed_rate_avg):.2f} - {np.max(feed_rate_avg):.2f} Hz")
+    print(f"   Raw signal std dev: {df['infeed_hz_actual'].std():.2f} Hz")
+    print(f"   Moving average std dev: {np.std(feed_rate_avg):.2f} Hz")
+    print(f"   Smoothing factor: {df['infeed_hz_actual'].std() / np.std(feed_rate_avg):.1f}x reduction in variability")
+
+
+def create_3d_analysis_plot(df):
+    """
+    Create a 3D plot showing the relationship between RPM, Kiln Weight, and Residuals
+    """
+    # Get clean data for all three variables
+    required_cols = ["kiln_rpm", "kiln_weight_avg", "bucket_mass_resid"]
+    df_3d = df[required_cols].dropna()
+
+    if len(df_3d) == 0:
+        print("   ❌ Not enough data for 3D analysis - missing RPM, kiln weight, or residuals")
+        return
+
+    print(f"\n   📊 3D ANALYSIS DATA:")
+    print(f"   Data points available: {len(df_3d)}")
+    print(f"   RPM range: {df_3d['kiln_rpm'].min():.1f} - {df_3d['kiln_rpm'].max():.1f}")
+    print(f"   Kiln weight range: {df_3d['kiln_weight_avg'].min():.1f} - {df_3d['kiln_weight_avg'].max():.1f}")
+    print(f"   Residual range: {df_3d['bucket_mass_resid'].min():.3f} - {df_3d['bucket_mass_resid'].max():.3f}")
+
+    # Create 3D scatter plot
+    fig = plt.figure(figsize=(15, 12))
+
+    # Plot 1: 3D scatter plot
+    ax1 = fig.add_subplot(221, projection="3d")
+
+    # Color points by residual magnitude (absolute value)
+    residual_abs = np.abs(df_3d["bucket_mass_resid"])
+    scatter = ax1.scatter(
+        df_3d["kiln_rpm"],
+        df_3d["kiln_weight_avg"],
+        df_3d["bucket_mass_resid"],
+        c=residual_abs,
+        cmap="viridis",
+        alpha=0.6,
+        s=20,
+    )
+
+    ax1.set_xlabel("Kiln RPM")
+    ax1.set_ylabel("Kiln Weight (kg)")
+    ax1.set_zlabel("Residual")
+    ax1.set_title("3D: RPM vs Weight vs Residual\n(Color = Residual Magnitude)")
+
+    # Add colorbar
+    plt.colorbar(scatter, ax=ax1, shrink=0.5, aspect=20, label="|Residual|")
+
+    # Plot 2: RPM vs Residual (2D projection)
+    ax2 = fig.add_subplot(222)
+    ax2.scatter(df_3d["kiln_rpm"], df_3d["bucket_mass_resid"], alpha=0.6, s=15)
+    ax2.set_xlabel("Kiln RPM")
+    ax2.set_ylabel("Residual")
+    ax2.set_title("RPM vs Residual")
+    ax2.grid(True, alpha=0.3)
+
+    # Add trend line for RPM vs Residual
+    z_rpm = np.polyfit(df_3d["kiln_rpm"], df_3d["bucket_mass_resid"], 1)
+    p_rpm = np.poly1d(z_rpm)
+    ax2.plot(
+        df_3d["kiln_rpm"], p_rpm(df_3d["kiln_rpm"]), "r--", alpha=0.8, label=f"Trend: y={z_rpm[0]:.4f}x+{z_rpm[1]:.4f}"
+    )
+    ax2.legend()
+
+    # Plot 3: Weight vs Residual (2D projection)
+    ax3 = fig.add_subplot(223)
+    ax3.scatter(df_3d["kiln_weight_avg"], df_3d["bucket_mass_resid"], alpha=0.6, s=15)
+    ax3.set_xlabel("Kiln Weight (kg)")
+    ax3.set_ylabel("Residual")
+    ax3.set_title("Kiln Weight vs Residual")
+    ax3.grid(True, alpha=0.3)
+
+    # Add trend line for Weight vs Residual
+    z_wt = np.polyfit(df_3d["kiln_weight_avg"], df_3d["bucket_mass_resid"], 1)
+    p_wt = np.poly1d(z_wt)
+    ax3.plot(
+        df_3d["kiln_weight_avg"],
+        p_wt(df_3d["kiln_weight_avg"]),
+        "r--",
+        alpha=0.8,
+        label=f"Trend: y={z_wt[0]:.4f}x+{z_wt[1]:.4f}",
+    )
+    ax3.legend()
+
+    # Plot 4: RPM vs Weight (colored by residual)
+    ax4 = fig.add_subplot(224)
+    scatter2 = ax4.scatter(
+        df_3d["kiln_rpm"], df_3d["kiln_weight_avg"], c=df_3d["bucket_mass_resid"], cmap="RdBu_r", alpha=0.6, s=20
+    )
+    ax4.set_xlabel("Kiln RPM")
+    ax4.set_ylabel("Kiln Weight (kg)")
+    ax4.set_title("RPM vs Weight\n(Color = Residual)")
+    ax4.grid(True, alpha=0.3)
+    plt.colorbar(scatter2, ax=ax4, label="Residual")
+
+    plt.tight_layout()
+    plt.show()
+
+    # Calculate and print correlations
+    print(f"\n   📈 CORRELATION MATRIX:")
+    corr_rpm_resid = np.corrcoef(df_3d["kiln_rpm"], df_3d["bucket_mass_resid"])[0, 1]
+    corr_weight_resid = np.corrcoef(df_3d["kiln_weight_avg"], df_3d["bucket_mass_resid"])[0, 1]
+    corr_rpm_weight = np.corrcoef(df_3d["kiln_rpm"], df_3d["kiln_weight_avg"])[0, 1]
+
+    print(f"   RPM ↔ Residual:     {corr_rpm_resid:.4f}")
+    print(f"   Weight ↔ Residual:  {corr_weight_resid:.4f}")
+    print(f"   RPM ↔ Weight:       {corr_rpm_weight:.4f}")
+
+    # Statistical significance tests
+    from scipy.stats import pearsonr
+
+    _, p_rpm_resid = pearsonr(df_3d["kiln_rpm"], df_3d["bucket_mass_resid"])
+    _, p_weight_resid = pearsonr(df_3d["kiln_weight_avg"], df_3d["bucket_mass_resid"])
+    _, p_rpm_weight = pearsonr(df_3d["kiln_rpm"], df_3d["kiln_weight_avg"])
+
+    print(f"\n   🧪 STATISTICAL SIGNIFICANCE (p-values):")
+    print(
+        f"   RPM ↔ Residual:     p={p_rpm_resid:.4f} {'✅ Significant' if p_rpm_resid < 0.05 else '❌ Not significant'}"
+    )
+    print(
+        f"   Weight ↔ Residual:  p={p_weight_resid:.4f} {'✅ Significant' if p_weight_resid < 0.05 else '❌ Not significant'}"
+    )
+    print(
+        f"   RPM ↔ Weight:       p={p_rpm_weight:.4f} {'✅ Significant' if p_rpm_weight < 0.05 else '❌ Not significant'}"
+    )
+
+    return df_3d
 
 
 def create_plots(df):
