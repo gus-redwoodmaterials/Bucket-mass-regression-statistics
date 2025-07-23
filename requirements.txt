@@ -1,0 +1,7 @@
+pandas>=2.0.0
+matplotlib>=3.5.0
+numpy>=1.20.0
+scipy>=1.7.0
+pytz>=2021.1
+python-dateutil>=2.8.0
+rw-data-science-utils>=2.0.0
