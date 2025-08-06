@@ -1,0 +1,62 @@
+# Global query time range
+query_range:
+  start_utc: "2025-06-15 00:00:00"
+  stop_utc: "2025-08-04 00:00:00"
+
+# Model version for backfilled predictions (rc1_feedstock_dataset.py)
+scout_model_version: "runs:/014a080c97a946dfab0874b9b95fd5e8/model"
+
+# File paths for queried CSVs
+csv_paths:
+  ingest_ids: "scout_ingest_raw_061525_072225.csv"
+  scout_predictions: "scout_backfilled_raw.csv"
+  infeed_cvr_hz: "infeed_cvr_hz_061525_072225.csv"
+  main_fan_hz: "main_fan_hz_data_061525_072225.csv"
+
+# Output paths 
+outputs:
+  scout_buckets_dataset: "scout_buckets_dataset.csv"
+  main_fan_spike_windows: "main_fan_spike_windows_061525_072225.csv"
+
+# Tagpaths for querying sensor data
+tagpaths:
+  infeed_cvr_hz: "rc1/4420-calciner/4420-cvr-001/status/speed_feedback_hz"
+  main_fan_hz: "rc1/4430-exhaust/4430-fan-004/status/speed_feedback_hz"
+
+# Battery part thresholds for spike correlation (scout_precision_recall_curve.py)
+battery_thresholds:
+  "R1000046 - Mixed Li Medium": 3
+  "R1000049 - Mixed Li Small": 3
+  "R1000050 - NMC/NVA EV/ESS Packs": 1
+  "R1000056 - Polymer/LCO Laptop Pouch": 3
+  "R1000059 - Polymer Laptop": 3
+  # "R1000090 - PENA Small Scrap Cylindrical": 3, # No classifications during time range
+  "R1000110 - NMC Volks/Audi Pack": 1
+  "R1000237 - Lyft DDR": 1
+  "R1000312 - Ultium Pouch": 1
+  "R1000346 - Tesla JR Large": 5
+  "R1000392 - Mixed Cylindrical": 3
+  "R1000419 - Noco Jumpstarter": 3
+  # "R1000420 - NOCO Mod": 1,  # No classifications during time range
+  "R1000422 - Power Tool Pack": 3
+  "R1000635 - Tesla 2170": 3
+  "R1000636 - Tesla 4680": 5
+  "R1000636_0 - Tesla 4680 no can": 5
+  "R1000645 - Tesla 2170 Mod": 1
+  "R1000711 - Tesla 18650": 1
+  "R1000773 - Ultium Teardown": 1
+  "R1000784 - BMW Small Mod": 1
+  "R1000842 - Ultium/GM Mod": 1
+  "R1000853 - 18650 Mod": 1
+  "R1000875 - Cathode Scrap": 1
+  "R1000266 - Lime": 1
+  "R1000267 - Lyft": 1
+  "Unknown": 1
+
+# Conveyor parameters for t_entering_kiln calculations (rc1_feedstock_dataset.py)
+conveyor:
+  buckets_till_end: 15
+  avg_bucket_length_m: 1.13
+
+# Maximum minutes before spike to use in window generation (scout_precision_recall_curve.py)
+max_window_minutes: 30

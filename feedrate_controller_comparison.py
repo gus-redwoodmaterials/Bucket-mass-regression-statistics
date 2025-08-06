@@ -30,7 +30,7 @@ TAGS = {
     "large_module_cycle_time": "rc1/4420-calciner/acmestatus/module_cycle_time_mpc_ts_now",
     "cycle_time_complete": "rc1/4420-calciner/module_loading/hmi/cycle_time_complete/value",
     "infeed_hz_actual": "rc1/4420-calciner/4420-cvr-001/status/speed_feedback_hz",
-    "kiln_weight_avg": "rc1/4420-calciner/hmi/kilnweightavg/value",
+    "kiln_weight_avg": "RC1/4420-Calciner/4420-WT-0007_Alarm/Input".lower(),
     "kiln_rpm": "rc1/4420-calciner/4420-kln-001_rpm/input",
     "kiln_weight_setpoint": "rc1/4420-calciner/hmi/4420-kln-001_weight_sp/value",
     "acme_alive": "rc1/4420-calciner/acme/acmefeedrate/acmealive",
@@ -43,6 +43,7 @@ TAGS = {
 TABLE_PATH = "cleansed.rc1_historian"
 pacific_tz = pytz.timezone("US/Pacific")
 DATA_TIMESTEP_SECONDS = 3
+SMOOTH_SIDE_POINTS = 5  # ±5 → 11-point window
 
 
 def load_data(start_date_str, end_date_str, description="data"):
@@ -132,169 +133,76 @@ def load_data(start_date_str, end_date_str, description="data"):
     return df
 
 
-def analyze_kiln_weight_rate(df, rate_threshold_kg_per_hr=1500, rate_window_minutes=15, smoothing_window_minutes=5):
+# Constants
+DATA_TIMESTEP_SECONDS = 3  # 1 sample every 3 s
+SMOOTH_SIDE_POINTS = 5  # ±5 → 11-point window
+
+
+def analyze_kiln_weight_rate(df, rate_threshold_kg_per_hr=1500, rate_window_minutes=15):
     """
-    Analyze rate of change in kiln weight over realistic time windows
-    Handle data gaps properly to avoid false rate spikes
+    Sliding‐window rate analysis with simple smoothing.
 
-    Args:
-        df: DataFrame with kiln_weight_avg and timestamp columns
-        rate_threshold_kg_per_hr: Threshold for high rate events (default: 1500 kg/hr = 1.5 ton/hr)
-        rate_window_minutes: Time window for calculating actual rates (default: 15 minutes)
-        smoothing_window_minutes: Window size for smoothing filter (default: 5 minutes)
-
-    Returns:
-        Dictionary with rate analysis results
+    Returns
+    -------
+    dict
+        high_rate_events  : int     – number of contiguous excursions
+        max_rate          : float   – peak kg/h
+        max_rate_time     : pd.Timestamp | None
+        rate_threshold    : float   – echo input
     """
-    if "kiln_weight_avg" not in df.columns or "timestamp" not in df.columns:
-        return None
+    if {"kiln_weight_avg", "timestamp"} - set(df.columns):
+        return {"high_rate_events": 0, "max_rate": 0, "max_rate_time": None, "rate_threshold": rate_threshold_kg_per_hr}
 
-    # Create a copy and remove NaN/negative values (should already be filtered in load_data)
-    df_clean = df[["timestamp", "kiln_weight_avg"]].dropna().copy()
+    # --- clean & sort ---
+    clean = (
+        df[["timestamp", "kiln_weight_avg"]]
+        .dropna()
+        .assign(timestamp=lambda d: pd.to_datetime(d["timestamp"], errors="coerce").dt.tz_localize(None))
+        .dropna(subset=["timestamp"])
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
 
-    # Sort by timestamp to ensure proper ordering
-    df_clean = df_clean.sort_values("timestamp").reset_index(drop=True)
+    if clean.empty:
+        return {"high_rate_events": 0, "max_rate": 0, "max_rate_time": None, "rate_threshold": rate_threshold_kg_per_hr}
 
-    # CRITICAL: Identify and handle data gaps caused by operational filtering
-    df_clean["time_diff_seconds"] = df_clean["timestamp"].diff().dt.total_seconds()
+    # --- 1) ±5-point moving mean ---
+    smooth = (
+        clean["kiln_weight_avg"]
+        .rolling(window=2 * SMOOTH_SIDE_POINTS + 1, center=True, min_periods=1)
+        .mean()
+        .to_numpy()
+    )
 
-    # Find large gaps (more than 30 seconds suggests missing data from filtering)
-    large_gaps = df_clean["time_diff_seconds"] > 30
-    gap_count = large_gaps.sum()
+    # --- 2) change in mass over 15 min (fixed lag) ---
+    rate_window_pts = int(rate_window_minutes * 60 / DATA_TIMESTEP_SECONDS)  # ≈300
+    if len(smooth) <= rate_window_pts:
+        return {"high_rate_events": 0, "max_rate": 0, "max_rate_time": None, "rate_threshold": rate_threshold_kg_per_hr}
 
-    print(f"   Data continuity check: Found {gap_count} gaps >30 seconds in filtered data")
+    delta_m = smooth[rate_window_pts:] - smooth[:-rate_window_pts]
+    rates = delta_m * 3600 / (rate_window_minutes * 60)  # kg / h   (== delta_m * 4)
+    rate_time = clean["timestamp"].iloc[rate_window_pts:].to_numpy()
 
-    # Apply light smoothing to reduce noise, but only within continuous segments
-    smoothing_points = max(5, int(smoothing_window_minutes * 60 / 3))  # 5 min = ~100 points
+    # --- 3) detect excursions above threshold ---
+    above = rates > rate_threshold_kg_per_hr
+    edges = np.diff(np.concatenate(([0], above.view(np.int8), [0])))
+    starts = np.where(edges == 1)[0]  # rising edge indices
+    ends = np.where(edges == -1)[0] - 1  # falling edges
 
-    # Create segments between gaps for separate smoothing
-    df_clean["segment"] = large_gaps.cumsum()
+    high_rate_events = len(starts)
+    if high_rate_events == 0:
+        return {"high_rate_events": 0, "max_rate": 0, "max_rate_time": None, "rate_threshold": rate_threshold_kg_per_hr}
 
-    # Apply smoothing within each continuous segment
-    def smooth_segment(segment_df):
-        if len(segment_df) < 5:  # Too small to smooth meaningfully
-            segment_df["weight_smoothed"] = segment_df["kiln_weight_avg"]
-        else:
-            # Adjust window size for small segments
-            window_size = min(smoothing_points, len(segment_df) // 2)
-            segment_df["weight_smoothed"] = (
-                segment_df["kiln_weight_avg"]
-                .rolling(
-                    window=window_size,
-                    center=True,
-                    min_periods=max(1, window_size // 4),
-                )
-                .mean()
-            )
-            # Fill any remaining NaN values at edges
-            segment_df["weight_smoothed"] = segment_df["weight_smoothed"].bfill().ffill()
-        return segment_df
-
-    # Apply smoothing to each continuous segment
-    df_clean = df_clean.groupby("segment").apply(smooth_segment).reset_index(drop=True)
-
-    # Calculate rates over meaningful time windows, but ONLY within continuous segments
-    rate_window_points = int(rate_window_minutes * 60 / 3)  # Convert window to data points -- standard = 15 minutes
-
-    rates_list = []
-
-    # Calculate rate for each point using a window of data around it
-    for i in range(rate_window_points, len(df_clean) - rate_window_points):
-        # Look backward from current point
-        start_idx = i - rate_window_points
-        end_idx = i
-
-        # CRITICAL: Check if this window spans across a data gap
-        # If any point in the window has a large time gap, skip this calculation
-        window_data = df_clean.iloc[start_idx : end_idx + 1]
-        max_gap_in_window = window_data["time_diff_seconds"].max()
-
-        if max_gap_in_window > 30:  # Skip if window contains data gaps
-            continue
-
-        # Also check if all points are in the same continuous segment
-        segments_in_window = window_data["segment"].nunique()
-        if segments_in_window > 1:  # Skip if window spans multiple segments
-            continue
-
-        # Get time span and weight change over the window
-        time_start = df_clean.iloc[start_idx]["timestamp"]
-        time_end = df_clean.iloc[end_idx]["timestamp"]
-        weight_start = df_clean.iloc[start_idx]["weight_smoothed"]
-        weight_end = df_clean.iloc[end_idx]["weight_smoothed"]
-
-        # Calculate actual time difference
-        time_diff_hours = (time_end - time_start).total_seconds() / 3600
-
-        rate_kg_per_hr = (weight_end - weight_start) / time_diff_hours
-
-        rates_list.append(
-            {
-                "timestamp": time_end,
-                "rate_kg_per_hr": rate_kg_per_hr,
-                "weight_start": weight_start,
-                "weight_end": weight_end,
-                "time_window_hours": time_diff_hours,
-                "weight_change": weight_end - weight_start,
-                "segment": df_clean.iloc[end_idx]["segment"],
-            }
-        )
-
-    if len(rates_list) == 0:
-        return {"high_rate_events": 0, "max_rate": 0, "max_rate_time": None}
-
-    # Convert to DataFrame for easier analysis
-    valid_rates = pd.DataFrame(rates_list)
-
-    # Add additional sanity checks (more conservative given gap handling)
-    max_reasonable_rate = 5000  # Reduced from 10000 - 5 tons/hr max
-    valid_rates = valid_rates[
-        (valid_rates["rate_kg_per_hr"] != np.inf)
-        & (valid_rates["rate_kg_per_hr"] != -np.inf)
-        & (abs(valid_rates["rate_kg_per_hr"]) < max_reasonable_rate)
-        & (abs(valid_rates["weight_change"]) < 1000)  # Reduced from 2000 - max 1 ton change in 15 min
-    ].copy()
-
-    if len(valid_rates) == 0:
-        return {"high_rate_events": 0, "max_rate": 0, "max_rate_time": None}
-
-    # Debug output
-    print(f"   Rate analysis using {rate_window_minutes}-minute windows:")
-    print(f"   {len(valid_rates)} valid rate calculations from {len(df_clean)} total points")
-    print(f"   Smoothing window: {smoothing_points} points ({smoothing_window_minutes} minutes)")
-    print(f"   Continuous segments: {df_clean['segment'].nunique()}")
-
-    # Count events where rate exceeds threshold
-    high_rate_events = (valid_rates["rate_kg_per_hr"] > rate_threshold_kg_per_hr).sum()
-
-    # Find maximum rate and its timestamp
-    max_rate = valid_rates["rate_kg_per_hr"].max()
-    max_rate_idx = valid_rates["rate_kg_per_hr"].idxmax()
-    max_rate_time = valid_rates.loc[max_rate_idx, "timestamp"] if not pd.isna(max_rate_idx) else None
-
-    # Provide context for high rates
-    if max_rate_time and max_rate > 1500:  # Lower threshold for context since we're more conservative
-        max_event = valid_rates.loc[max_rate_idx]
-        print(f"   📊 Maximum rate event: {max_rate:.0f} kg/hr at {max_rate_time}")
-        print(
-            f"       Weight change: {max_event['weight_change']:.1f} kg over {max_event['time_window_hours']:.2f} hours"
-        )
-        print(f"       From {max_event['weight_start']:.1f} to {max_event['weight_end']:.1f} kg")
-        print(f"       In continuous segment #{max_event['segment']}")
+    # --- 4) stats for the excursion with the absolute peak ---
+    max_idx = np.argmax(rates)
+    max_rate = rates[max_idx]
+    peak_time = rate_time[max_idx]
 
     return {
         "high_rate_events": high_rate_events,
-        "max_rate": max_rate,
-        "max_rate_time": max_rate_time,
-        "rate_window_minutes": rate_window_minutes,
-        "smoothing_window_minutes": smoothing_window_minutes,
+        "max_rate": float(max_rate),
+        "max_rate_time": peak_time,
         "rate_threshold": rate_threshold_kg_per_hr,
-        "valid_rate_points": len(valid_rates),
-        "total_points": len(df_clean),
-        "continuous_segments": df_clean["segment"].nunique(),
-        "data_gaps": gap_count,
-        "df_clean": df_clean,  # Include processed data for plotting
-        "valid_rates": valid_rates,  # Include valid rates for plotting
     }
 
 
@@ -394,85 +302,26 @@ def analyze_main_fan_spikes(
             }
         )
 
+    total_time_in_df = df_clean.shape[0] * DATA_TIMESTEP_SECONDS / 3600  # Total time in hours
     # Calculate time span and daily average
     total_time_hours = (df_clean["timestamp"].iloc[-1] - df_clean["timestamp"].iloc[0]).total_seconds() / 3600
     total_time_days = total_time_hours / 24
     spikes_per_day = len(fan_spike_events) / total_time_days if total_time_days > 0 else 0
+    fan_spike_per_hour_acme = len(fan_spike_events) / total_time_in_df if total_time_in_df > 0 else 0
 
     print(f"   Fan spike analysis ({rolling_window_seconds}s rolling avg > {fan_spike_threshold_hz} Hz):")
     print(f"   Total fan spikes: {len(fan_spike_events)} over {total_time_days:.1f} days")
     print(f"   Average spikes per day: {spikes_per_day:.1f}")
-
-    # Analyze correlation with feeding rate increases if kiln weight data is available
-    correlation_analysis = None
-    if "kiln_weight_avg" in df_clean.columns and len(fan_spike_events) > 0:
-        # Get feeding rate analysis (reuse the existing function logic but simplified)
-        rate_results = analyze_kiln_weight_rate(df, rate_threshold_kg_per_hr=feeding_rate_threshold_kg_per_hr)
-
-        if rate_results and len(rate_results["valid_rates"]) > 0:
-            feeding_events = rate_results["valid_rates"][
-                rate_results["valid_rates"]["rate_kg_per_hr"] > feeding_rate_threshold_kg_per_hr
-            ].copy()
-
-            print(f"   Sharp feeding events (>{feeding_rate_threshold_kg_per_hr} kg/hr): {len(feeding_events)}")
-
-            # Check correlations
-            feeding_followed_by_spike = 0
-            spike_preceded_by_feeding = 0
-            correlation_window_minutes = 30  # Look for correlations within 30 minutes
-
-            for _, feeding_event in feeding_events.iterrows():
-                feeding_time = feeding_event["timestamp"]
-
-                # Check if any fan spike occurs within 30 minutes after this feeding event
-                for spike in fan_spike_events:
-                    time_diff_minutes = (spike["start_time"] - feeding_time).total_seconds() / 60
-                    if 0 <= time_diff_minutes <= correlation_window_minutes:
-                        feeding_followed_by_spike += 1
-                        break
-
-            for spike in fan_spike_events:
-                spike_time = spike["start_time"]
-
-                # Check if any sharp feeding occurred within 30 minutes before this spike
-                for _, feeding_event in feeding_events.iterrows():
-                    feeding_time = feeding_event["timestamp"]
-                    time_diff_minutes = (spike_time - feeding_time).total_seconds() / 60
-                    if 0 <= time_diff_minutes <= correlation_window_minutes:
-                        spike_preceded_by_feeding += 1
-                        break
-
-            feeding_spike_correlation_pct = (
-                (feeding_followed_by_spike / len(feeding_events) * 100) if len(feeding_events) > 0 else 0
-            )
-            spike_feeding_correlation_pct = (
-                (spike_preceded_by_feeding / len(fan_spike_events) * 100) if len(fan_spike_events) > 0 else 0
-            )
-
-            print(
-                f"   Feeding→Spike correlation: {feeding_followed_by_spike}/{len(feeding_events)} ({feeding_spike_correlation_pct:.1f}%) feeding events followed by fan spike within {correlation_window_minutes} min"
-            )
-            print(
-                f"   Spike←Feeding correlation: {spike_preceded_by_feeding}/{len(fan_spike_events)} ({spike_feeding_correlation_pct:.1f}%) fan spikes preceded by sharp feeding within {correlation_window_minutes} min"
-            )
-
-            correlation_analysis = {
-                "feeding_events": len(feeding_events),
-                "feeding_followed_by_spike": feeding_followed_by_spike,
-                "spike_preceded_by_feeding": spike_preceded_by_feeding,
-                "feeding_spike_correlation_pct": feeding_spike_correlation_pct,
-                "spike_feeding_correlation_pct": spike_feeding_correlation_pct,
-                "correlation_window_minutes": correlation_window_minutes,
-            }
+    print(f"   Fan spikes per hour (controller running): {fan_spike_per_hour_acme:.3f}")
 
     return {
         "fan_spikes": len(fan_spike_events),
         "spike_events": fan_spike_events,
         "spikes_per_day": spikes_per_day,
+        "fan_spike_per_hour_acme": fan_spike_per_hour_acme,
         "total_time_days": total_time_days,
         "fan_spike_threshold_hz": fan_spike_threshold_hz,
         "rolling_window_seconds": rolling_window_seconds,
-        "correlation_analysis": correlation_analysis,
         "df_clean": df_clean,  # Include for plotting if needed
     }
 
@@ -590,7 +439,7 @@ def plot_kiln_weight_rate_analysis(rate_analysis_results, highlight_threshold=50
     ax2.axhline(
         y=highlight_threshold, color="red", linestyle="--", alpha=0.7, label=f"{highlight_threshold} kg/hr threshold"
     )
-    ax2.axhline(y=1000, color="orange", linestyle="--", alpha=0.7, label="1000 kg/hr (1 ton/hr)")
+    ax2.axhline(y=1500, color="orange", linestyle="--", alpha=0.7, label="1500 kg/hr (1 ton/hr)")
 
     ax2.set_ylabel("Rate (kg/hr)")
     ax2.set_xlabel("Time")
@@ -676,24 +525,14 @@ def analysis(df, description="dataset"):
             if rate_analysis["max_rate_time"]:
                 print(f"   Maximum rate occurred at: {rate_analysis['max_rate_time']}")
 
-            # Generate plot for visual inspection
-            print(f"   📊 Generating plot for visual inspection...")
-            plot_kiln_weight_rate_analysis(rate_analysis, highlight_threshold=1500)  # Highlight at 1.5 ton/hr threshold
-
-        # Analyze main fan spikes and correlations
+        # Analyze main fan spikes
         fan_analysis = analyze_main_fan_spikes(df)
         if fan_analysis:
             print(f"\n   🌪️  MAIN FAN SPIKE ANALYSIS:")
             print(f"   Total fan spikes: {fan_analysis['fan_spikes']}")
             print(f"   Average spikes per day: {fan_analysis['spikes_per_day']:.1f}")
-
-            if fan_analysis["correlation_analysis"]:
-                corr = fan_analysis["correlation_analysis"]
-                print(f"   📊 Feeding-Fan Spike Correlations:")
-                print(
-                    f"       {corr['feeding_spike_correlation_pct']:.1f}% of sharp feeding events followed by fan spike"
-                )
-                print(f"       {corr['spike_feeding_correlation_pct']:.1f}% of fan spikes preceded by sharp feeding")
+            if "fan_spike_per_hour_acme" in fan_analysis:
+                print(f"   Fan spikes per hour (controller running): {fan_analysis['fan_spike_per_hour_acme']:.3f}")
 
         # Return key metrics for comparison
         return {
@@ -711,6 +550,9 @@ def analysis(df, description="dataset"):
             "max_rate": rate_analysis["max_rate"] if rate_analysis else 0,
             "fan_spikes": fan_analysis["fan_spikes"] if fan_analysis else 0,
             "spikes_per_day": fan_analysis["spikes_per_day"] if fan_analysis else 0,
+            "fan_spike_per_hour_acme": fan_analysis["fan_spike_per_hour_acme"]
+            if fan_analysis and "fan_spike_per_hour_acme" in fan_analysis
+            else 0,
         }
     else:
         print(f"\n   📊 KILN WEIGHT OVERSHOOT ANALYSIS:")
@@ -741,34 +583,78 @@ def main():
     analyze_data = "--analyze" in sys.argv or "-a" in sys.argv
 
     # Example date ranges - modify these as needed
-    before_start = "2025-05-04T10:00:00"  # May 5th 2pm
-    before_end = "2025-05-05T10:00:00"  # May 5th 3pm
-    after_start = "2025-07-20T08:32:00"  # Modify this date
-    after_end = "2025-07-21T12:00:00"  # Modify this date
+    before_start = "2025-06-04T10:00:00"  # June 4th 10am
+    before_end = "2025-07-22T00:00:00"  # June 4th 11am
+    after_start = "2025-07-22T00:00:00"  # Modify this date
+    after_end = "2025-08-04T09:00:00"  # Modify this date
 
-    # Load May 8-9 data
+    # Load June 4th data
     print(f"\n🔍 Loading data...")
     df_before = load_data(before_start, before_end, "before_controller")
+    df_after = load_data(after_start, after_end, "after_controller")
 
     # Perform analysis if requested
-    if False:
+    if True:
         print(f"\n{'=' * 60}")
         print("before_controller ANALYSIS")
         print(f"{'=' * 60}")
 
         # Analyze May 8-9 data
-        results = analysis(df_before, "before_controller")
+        results_before = analysis(df_before, "before_controller")
 
         # Uncomment these lines when you have after data:
-        # results_after = analysis(df_after, "AFTER controller")
-        #
-        # # Compare results
-        # if results_before and results_after:
-        #     print(f"\n📊 COMPARISON SUMMARY:")
-        #     print(f"   BEFORE: {results_before['avg_overshoot_magnitude']:.2f} kg avg overshoot")
-        #     print(f"   AFTER:  {results_after['avg_overshoot_magnitude']:.2f} kg avg overshoot")
-        #     improvement = results_before['avg_overshoot_magnitude'] - results_after['avg_overshoot_magnitude']
-        #     print(f"   IMPROVEMENT: {improvement:.2f} kg ({improvement/results_before['avg_overshoot_magnitude']*100:.1f}% reduction)")
+        results_after = analysis(df_after, "AFTER controller")
+
+        # Compare results
+        if results_before and results_after:
+            print(f"\n📊 COMPARISON SUMMARY:")
+            print(f"   BEFORE: {results_before['avg_overshoot_magnitude']:.2f} kg avg overshoot")
+            print(f"   AFTER:  {results_after['avg_overshoot_magnitude']:.2f} kg avg overshoot")
+            improvement = results_before["avg_overshoot_magnitude"] - results_after["avg_overshoot_magnitude"]
+            print(
+                f"   IMPROVEMENT: {improvement:.2f} kg ({improvement / results_before['avg_overshoot_magnitude'] * 100:.1f}% reduction)"
+            )
+
+            # Sharp increases in fan rate per day
+            if (
+                "high_rate_events" in results_before
+                and "high_rate_events" in results_after
+                and "total_points" in results_before
+                and "total_points" in results_after
+            ):
+                # Calculate days for before and after
+                before_days = results_before["total_points"] * 3 / 3600 / 24  # 3 sec per point
+                after_days = results_after["total_points"] * 3 / 3600 / 24
+                before_sharp_per_day = results_before["high_rate_events"] / before_days if before_days > 0 else 0
+                after_sharp_per_day = results_after["high_rate_events"] / after_days if after_days > 0 else 0
+                sharp_improvement = before_sharp_per_day - after_sharp_per_day
+                print(f"   BEFORE: {before_sharp_per_day:.2f} sharp increases per day")
+                print(f"   AFTER:  {after_sharp_per_day:.2f} sharp increases per day")
+                print(
+                    f"   IMPROVEMENT: {sharp_improvement:.2f} per day ({(sharp_improvement / before_sharp_per_day * 100) if before_sharp_per_day else 0:.1f}% reduction)"
+                )
+
+            # Fan spikes per day
+            if "spikes_per_day" in results_before and "spikes_per_day" in results_after:
+                before_spikes_per_day = results_before["spikes_per_day"]
+                after_spikes_per_day = results_after["spikes_per_day"]
+                spike_improvement = before_spikes_per_day - after_spikes_per_day
+                print(f"   BEFORE: {before_spikes_per_day:.2f} fan spikes per day")
+                print(f"   AFTER:  {after_spikes_per_day:.2f} fan spikes per day")
+                print(
+                    f"   IMPROVEMENT: {spike_improvement:.2f} per day ({(spike_improvement / before_spikes_per_day * 100) if before_spikes_per_day else 0:.1f}% reduction)"
+                )
+
+            # Fan spikes per hour (controller running)
+            if "fan_spike_per_hour_acme" in results_before and "fan_spike_per_hour_acme" in results_after:
+                before_spikes_per_hour = results_before["fan_spike_per_hour_acme"]
+                after_spikes_per_hour = results_after["fan_spike_per_hour_acme"]
+                spike_hour_improvement = before_spikes_per_hour - after_spikes_per_hour
+                print(f"   BEFORE: {before_spikes_per_hour:.3f} fan spikes per hour (controller running)")
+                print(f"   AFTER:  {after_spikes_per_hour:.3f} fan spikes per hour (controller running)")
+                print(
+                    f"   IMPROVEMENT: {spike_hour_improvement:.3f} per hour ({(spike_hour_improvement / before_spikes_per_hour * 100) if before_spikes_per_hour else 0:.1f}% reduction)"
+                )
     else:
         print(f"\n💡 Use --analyze or -a flag to perform overshoot analysis")
         print(f"   Example: python feedrate_controller_comparison.py --analyze")

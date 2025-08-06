@@ -1,0 +1,199 @@
+import pandas as pd
+import numpy as np
+import pytz
+import os
+import sys
+from dateutil.parser import parse
+from rw_data_science_utils.athena_download import athena_download
+import matplotlib.pyplot as plt
+import warnings
+
+# Suppress all FutureWarning messages
+warnings.simplefilter(action="ignore", category=FutureWarning)
+
+
+DATA_FOLDER = "data"
+TABLE_PATH = "cleansed.rc1_historian"
+pacific_tz = pytz.timezone("US/Pacific")
+DATA_TIMESTEP_SECONDS = 1
+
+
+if not os.path.exists(DATA_FOLDER):
+    os.makedirs(DATA_FOLDER)
+
+TAGS = {
+    "Motor amps": "RC1/4420-Calciner/4420-KLN-001-MTR-001_Current/Input".lower(),
+    "Small Mod Feed": "RC1/4420-Calciner/4420-CVR-001/Status/Speed_Feedback_Hz".lower(),
+    "Robot ON": "RC1/PLC8-Infeed_Robot/HMI/Feed_Robot_Mode/Value".lower(),
+    "RPM": "RC1/4420-Calciner/4420-KLN-001_RPM/Input".lower(),
+    "Kiln Weight": "RC1/4420-Calciner/4420-WT-0007_Alarm/Input".lower(),
+    "Large Mod Feed": "RC1/4420-Calciner/Module_Loading/HMI/Cycle_Time_Complete/Value".lower(),
+    "N2 Cons": "RC1/4420-Calciner/4420-FT-0001_Vol_Flow_Ave/Input".lower(),
+    "Zone 1 Temp": "RC1/4420-Calciner/4420-TE-7210-B_AI/Input_Scaled".lower(),
+}
+
+
+def load_data(start_date_str, end_date_str, description="data"):
+    start = pacific_tz.localize(parse(start_date_str))
+    end = pacific_tz.localize(parse(end_date_str))
+
+    start_str = start.strftime("%Y%m%d_%H%M")
+    end_str = end.strftime("%Y%m%d_%H%M")
+    csv_filename = f"athena_{description}_{start_str}_to_{end_str}.csv"
+    csv_avg_filename = f"athena_{description}_{start_str}_to_{end_str}_avg.csv"
+    csv_path = os.path.join(DATA_FOLDER, csv_filename)
+    csv_avg_path = os.path.join(DATA_FOLDER, csv_avg_filename)
+
+    refresh_data = "--refresh" in sys.argv or "-r" in sys.argv
+
+    if not refresh_data and os.path.exists(csv_path):
+        print(f"Loading from cache: {csv_filename}")
+        df = pd.read_csv(csv_path)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+        # Check if averaged data exists
+        if os.path.exists(csv_avg_path):
+            print(f"Loading averaged data from cache: {csv_avg_filename}")
+            df_avg = pd.read_csv(csv_avg_path)
+            df_avg["timestamp"] = pd.to_datetime(df_avg["timestamp"])
+            return df, df_avg
+        else:
+            print("Calculating per-revolution averages...")
+            df_avg = make_rpm_rolling_avg(df)
+            df_avg.to_csv(csv_avg_path, index=False)
+            print(f"Cached averaged data: {csv_avg_filename}")
+            return df, df_avg
+    else:
+        print(f"Fetching from Athena: {start_str} to {end_str}")
+        try:
+            df = athena_download.get_pivoted_athena_data(
+                TAGS,
+                start,
+                end,
+                TABLE_PATH,
+                DATA_TIMESTEP_SECONDS,
+            )
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            df.to_csv(csv_path, index=False)
+            print(f"Cached: {csv_filename}")
+
+            # Calculate and cache averaged data
+            print("Calculating per-revolution averages...")
+            df_avg = make_rpm_rolling_avg(df)
+            df_avg.to_csv(csv_avg_path, index=False)
+            print(f"Cached averaged data: {csv_avg_filename}")
+
+            return df, df_avg
+        except KeyError as e:
+            print(f"Error fetching data: {e}")
+            print("This usually means no data was returned for the specified tags and time range")
+            print(f"Tags being queried: {list(TAGS.keys())}")
+            return pd.DataFrame(), pd.DataFrame()  # Return empty dataframes
+
+
+def make_rpm_rolling_avg(df):
+    """
+    Get rolling avg (per single rev) for all sensor values
+    """
+    t = df["timestamp"].to_numpy()
+    rpm = df["RPM"].to_numpy()
+    angle = 0  # degrees
+
+    t_avg = []
+    wt_avg = []
+    rpm_avg = []
+    motor_amps_avg = []
+    small_mod_feed_avg = []
+    robot_on_avg = []
+    large_mod_feed_avg = []
+    n2_cons_avg = []
+    zone1_temp_avg = []
+
+    revs_complete = 0
+    wt_rev = 0
+    rpm_rev = 0
+    motor_amps_rev = 0
+    small_mod_feed_rev = 0
+    robot_on_rev = 0
+    large_mod_feed_rev = 0
+    n2_cons_rev = 0
+    zone1_temp_rev = 0
+    num_pts_rev = 0
+
+    for i in range(1, len(rpm)):
+        angle += rpm[i] * (t[i] - t[i - 1]) / np.timedelta64(1, "s") / 60 * 360
+
+        wt_rev += df.iloc[i, df.columns.get_loc("Kiln Weight")]
+        rpm_rev += rpm[i]
+        motor_amps_rev += df.iloc[i, df.columns.get_loc("Motor amps")]
+        num_pts_rev += 1
+
+        if angle >= 360 * (revs_complete + 1):
+            revs_complete += 1
+            t_avg.append(t[i])
+            rpm_avg.append(rpm_rev / num_pts_rev)
+            wt_avg.append(wt_rev / num_pts_rev)
+            motor_amps_avg.append(motor_amps_rev / num_pts_rev)
+            small_mod_feed_avg.append(small_mod_feed_rev / num_pts_rev)
+            robot_on_avg.append(robot_on_rev / num_pts_rev)
+            large_mod_feed_avg.append(large_mod_feed_rev / num_pts_rev)
+            n2_cons_avg.append(n2_cons_rev / num_pts_rev)
+            zone1_temp_avg.append(zone1_temp_rev / num_pts_rev)
+
+            wt_rev = 0
+            rpm_rev = 0
+            motor_amps_rev = 0
+            small_mod_feed_rev = 0
+            robot_on_rev = 0
+            large_mod_feed_rev = 0
+            n2_cons_rev = 0
+            zone1_temp_rev = 0
+            num_pts_rev = 0
+
+    df_avg = pd.DataFrame(
+        {
+            "timestamp": np.array(t_avg),
+            "Kiln Weight": np.array(wt_avg),
+            "Avg_Motor_Amps": np.array(motor_amps_avg),
+        }
+    )
+
+    return df_avg
+
+
+def add_mapping_column(df, ingest_id_times):
+    """
+    Add a mapping column to the DataFrame based on ingest_id_times.
+    """
+    df["ingest_id"] = None
+    for ingest_id, times in ingest_id_times.items():
+        for time in times:
+            df.loc[df["timestamp"] == time, "ingest_id"] = ingest_id
+    return df
+
+
+def run():
+    start_utc = "2025-06-15 00:00:00"
+    stop_utc = "2025-08-04 00:00:00"
+
+    df, df_avg = load_data(start_utc, stop_utc)
+
+    # Add a label column to distinguish the two DataFrames
+    df_labeled = df.copy()
+    df_labeled["source"] = "raw"
+    df_avg_labeled = df_avg.copy()
+    df_avg_labeled["source"] = "avg"
+
+    # Align columns for concatenation
+    all_cols = sorted(set(df_labeled.columns) | set(df_avg_labeled.columns))
+    df_labeled = df_labeled.reindex(columns=all_cols)
+    df_avg_labeled = df_avg_labeled.reindex(columns=all_cols)
+
+    # Concatenate and write to CSV
+    combined = pd.concat([df_labeled, df_avg_labeled], ignore_index=True)
+    combined.to_csv("motor_amps.csv", index=False)
+    print("Wrote both raw and averaged data to motor_amps.csv")
+
+
+if __name__ == "__main__":
+    run()
