@@ -10,6 +10,26 @@ import warnings
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
 from statsmodels.stats.anova import anova_lm
+from sklearn.preprocessing import StandardScaler
+
+
+CLEANOUTS = pd.to_datetime(
+    [
+        "2025-06-02 12:00",
+        "2025-06-03 12:00",
+        "2025-06-22 12:00",
+        "2025-06-24 12:00",
+        "2025-06-25 12:00",
+        "2025-07-03 12:00",
+        "2025-07-08 12:00",
+        "2025-07-12 12:00",
+        "2025-07-15 12:00",
+        "2025-07-21 12:00",
+        "2025-07-23 12:00",
+        "2025-07-25 12:00",
+        "2025-07-29 12:00",
+    ]
+).tz_localize("utc")
 
 
 def count_batteries_per_window(
@@ -309,7 +329,7 @@ def create_analysis_dataframe(amps_df, buckets_df, battery_cols, start_time, sam
 
     # Create a new DataFrame for analysis
     rows = []
-
+    last_cleanout = CLEANOUTS[CLEANOUTS <= start_time].max()
     # For each timestamp, get motor amps and battery counts in previous hour
     for i, timestamp in enumerate(sampled_timestamps.index):
         print(f"Processing point {i + 1}/{len(sampled_timestamps)}...")
@@ -333,11 +353,18 @@ def create_analysis_dataframe(amps_df, buckets_df, battery_cols, start_time, sam
             rpm_val = amps_df.iloc[closest_idx]["rpm"] if "rpm" in amps_df.columns else np.nan
             kiln_weight_val = amps_df.iloc[closest_idx]["kiln_weight"] if "kiln_weight" in amps_df.columns else np.nan
 
-        # Get battery counts
+        # Get battery counts and cleanout info
         if window_size == -1:
+            last_cleanout = CLEANOUTS[CLEANOUTS <= timestamp].max()
             # Cumulative sum: use all batteries from beginning up to this timestamp
-            mask = buckets_df["t_entering_kiln_utc"] <= timestamp
+            mask = (buckets_df["t_entering_kiln_utc"] <= timestamp) & (
+                buckets_df["t_entering_kiln_utc"] > last_cleanout
+            )
             window_counts = buckets_df.loc[mask, battery_cols].sum()
+            # Calculate time since last cleanout
+            time_since_cleanout = (timestamp - last_cleanout).total_seconds() / 60.0  # in minutes
+            # Calculate total number of batteries since last cleanout
+            total_batteries_since_cleanout = buckets_df.loc[mask, battery_cols].sum().sum()
         else:
             # Rolling window: use batteries in previous hour
             window_start = timestamp - pd.Timedelta(hours=1)
@@ -347,14 +374,19 @@ def create_analysis_dataframe(amps_df, buckets_df, battery_cols, start_time, sam
                 window_size=window_size,  # Default 60 minutes = 1 hour
                 time_col="t_entering_kiln_utc",
             )
+            # For rolling window, set time since cleanout and total batteries since cleanout to NaN
+            time_since_cleanout = np.nan
+            total_batteries_since_cleanout = np.nan
 
-        # Create row with timestamp, motor amps, and battery counts
+        # Create row with timestamp, motor amps, battery counts, and new columns
         row = {
             "timestamp": timestamp,
             "motor_amps": motor_amps_val,
             "zone_1_temp": temp_val,
             "rpm": rpm_val,
             "kiln_weight": kiln_weight_val,
+            "time_since_cleanout": time_since_cleanout,
+            "total_batteries_since_cleanout": total_batteries_since_cleanout,
         }
 
         # Add battery counts (0 for batteries not in the window)
@@ -366,6 +398,66 @@ def create_analysis_dataframe(amps_df, buckets_df, battery_cols, start_time, sam
     # Create DataFrame with all data
     df = pd.DataFrame(rows)
     return df
+
+
+# ---------------------------------------------------------------------------
+#  Standardised-regression helper
+# ---------------------------------------------------------------------------
+
+
+def run_standardised_regression(
+    analysis_df: pd.DataFrame,
+    base_predictors: list,
+    category_predictors: list | None = None,
+    print_results: bool = True,
+):
+    """
+    Fit an OLS model after z-scaling every predictor (mean-0, std-1). The
+    absolute value of each resulting coefficient is directly comparable: it
+    represents the change in motor_amps produced by a *one-standard-deviation*
+    move in that predictor.
+
+    Returns
+    -------
+    model_std  : statsmodels RegressionResultsWrapper
+    beta_table : pd.DataFrame   # tidy view of standardised betas
+    """
+    if category_predictors is None:
+        category_predictors = [c for c in analysis_df.columns if c.startswith("cat_")]
+
+    X_cols = base_predictors + category_predictors
+    y = analysis_df["motor_amps"]
+
+    # ---- 1.  Standard-scale X ------------------------------------------------
+    scaler = StandardScaler()
+    X_z = pd.DataFrame(
+        scaler.fit_transform(analysis_df[X_cols]),
+        columns=X_cols,
+        index=analysis_df.index,
+    )
+    X_z = sm.add_constant(X_z)
+
+    # ---- 2.  Fit OLS with robust (HC3) SEs ----------------------------------
+    model_std = sm.OLS(y, X_z).fit(cov_type="HC3")
+
+    # ---- 3.  Tidy summary of standardised betas -----------------------------
+    beta = (
+        model_std.params.drop("const")  # we don’t rank the intercept
+        .to_frame("beta_std")
+        .assign(abs_beta=lambda d: d["beta_std"].abs())
+        .sort_values("abs_beta", ascending=False)
+    )
+
+    if print_results:
+        print("\n=== STANDARDISED (Z-SCORE) REGRESSION ===")
+        print(f"Included predictors: {', '.join(X_cols)}")
+        print("\nTop 10 predictors by |β| (amps per 1 SD move):")
+        print(beta.head(10).to_string(float_format=lambda x: f"{x:8.3f}"))
+        print(
+            f"\nModel R²: {model_std.rsquared:.3f}   Adj R²: {model_std.rsquared_adj:.3f}   n = {int(model_std.nobs)}"
+        )
+
+    return model_std, beta
 
 
 def run():
@@ -413,6 +505,7 @@ def run():
         battery_cols=battery_cols,  # Pass the underscore versions
         start_time=start_time,
         sample_interval="1T",  # 1 minute interval - adjust as needed
+        window_size=60,  # Use cumulative sum of all batteries up to each timestamp with cleanouts
     )
     analysis_df.columns = (
         analysis_df.columns.str.replace("`", "", regex=False)
@@ -424,8 +517,8 @@ def run():
 
     if len(analysis_df) > 0:
         print(f"\nCreated dataset with {len(analysis_df)} rows and {len(analysis_df.columns)} columns")
-        # investigation_cols = [col for col in battery_cols if col not in category_cols]
-        investigation_cols = category_cols
+        investigation_cols = [col for col in battery_cols if col not in category_cols]
+        # investigation_cols = category_cols
         # Calculate correlations between motor amps and each battery type
         correlations, sorted_correlations = calculate_category_correlations(analysis_df, investigation_cols)
 
@@ -446,19 +539,27 @@ def run():
         print("Correlation results written to battery_type_correlations.csv")
 
         # Define predictors for regression
+        # Only include time_since_cleanout and total_batteries_since_cleanout if they exist and are not all NaN
         base_predictors = ["rpm", "zone_1_temp", "kiln_weight"]
+        if "time_since_cleanout" in analysis_df.columns and not analysis_df["time_since_cleanout"].isna().all():
+            base_predictors.append("time_since_cleanout")
+        if (
+            "total_batteries_since_cleanout" in analysis_df.columns
+            and not analysis_df["total_batteries_since_cleanout"].isna().all()
+        ):
+            base_predictors.append("total_batteries_since_cleanout")
 
         # Run multiple linear regression
-        ols_model, impact_tbl = run_multiple_linear_regression(
+        model_std, beta_tbl = run_standardised_regression(
             analysis_df=analysis_df,
             base_predictors=base_predictors,
             category_predictors=investigation_cols,
             print_results=True,
         )
 
-        # Write regression coefficients/impacts to CSV
-        impact_tbl.to_csv("regression_impacts.csv", index=True)
-        print("Regression results written to regression_impacts.csv")
+        # Write standardised regression coefficients to CSV
+        beta_tbl.to_csv("regression_impacts.csv", index=True)
+        print("Standardised regression results written to regression_impacts.csv")
 
 
 if __name__ == "__main__":
