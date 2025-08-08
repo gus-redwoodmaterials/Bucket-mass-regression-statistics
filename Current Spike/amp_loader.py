@@ -198,6 +198,19 @@ def make_rpm_rolling_avg(df):
     return df_avg
 
 
+def loadcell_dif_zeroer(df, start_time=None, end_time=None):
+    """
+    Zero the load cell difference values in the DataFrame.
+    If start_time and end_time are provided, only zero the values in that range.
+    """
+    if start_time is not None and end_time is not None:
+        mask = (df["timestamp"] >= start_time) & (df["timestamp"] <= end_time)
+        df.loc[mask, "loadcell_diff"] = 0
+    else:
+        df["loadcell_diff"] = 0
+    return df
+
+
 def add_mapping_column(df, ingest_id_times):
     """
     Add a mapping column to the DataFrame based on ingest_id_times.
@@ -229,9 +242,8 @@ def run():
 
     mask = (df_avg["rpm"] < 0.08) & (df_avg["kiln_weight"] < 700)
     df_avg = df_avg[~mask]
+    df_avg = loadcell_dif_zeroer(df_avg)
 
-    # Concatenate and write to CSV
-    combined = pd.concat([df_labeled, df_avg], ignore_index=True)
     # Write df_avg to the Current Data folder
     output_dir = "Current Spike/Current Data"
     os.makedirs(output_dir, exist_ok=True)

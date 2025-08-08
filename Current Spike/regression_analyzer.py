@@ -13,7 +13,7 @@ def run():
     for fname in all_files:
         fpath = os.path.join(results_folder, fname)
         df = pd.read_csv(fpath)
-        if "material" in fname:
+        if "material" in fname or "cumulative" not in fname:
             continue
         if "standardized" in fname:
             # Rename 'beta_std' to 'impact' if present

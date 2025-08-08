@@ -343,16 +343,26 @@ def create_analysis_dataframe(amps_df, buckets_df, battery_cols, start_time, sam
                 motor_amps_val = val.mean()
             else:
                 motor_amps_val = val
-            temp_val = amps_df.loc[timestamp, "zone_1_temp"] if "zone_1_temp" in amps_df.columns else np.nan
+            temp_1_val = amps_df.loc[timestamp, "zone_1_temp"] if "zone_1_temp" in amps_df.columns else np.nan
             rpm_val = amps_df.loc[timestamp, "rpm"] if "rpm" in amps_df.columns else np.nan
             kiln_weight_val = amps_df.loc[timestamp, "kiln_weight"] if "kiln_weight" in amps_df.columns else np.nan
+            loadcell_diff_val = (
+                amps_df.loc[timestamp, "loadcell_diff"] if "loadcell_diff" in amps_df.columns else np.nan
+            )
+            temp_2_val = amps_df.loc[timestamp, "zone_2_temp"] if "zone_2_temp" in amps_df.columns else np.nan
+            temp_3_val = amps_df.loc[timestamp, "zone_3_temp"] if "zone_3_temp" in amps_df.columns else np.nan
         else:
             # Find closest timestamp if exact match not found
             closest_idx = np.argmin(np.abs(amps_df.index - timestamp))
             motor_amps_val = amps_df.iloc[closest_idx]["motor_amps"]
-            temp_val = amps_df.iloc[closest_idx]["zone_1_temp"] if "zone_1_temp" in amps_df.columns else np.nan
+            temp_1_val = amps_df.iloc[closest_idx]["zone_1_temp"] if "zone_1_temp" in amps_df.columns else np.nan
             rpm_val = amps_df.iloc[closest_idx]["rpm"] if "rpm" in amps_df.columns else np.nan
             kiln_weight_val = amps_df.iloc[closest_idx]["kiln_weight"] if "kiln_weight" in amps_df.columns else np.nan
+            loadcell_diff_val = (
+                amps_df.iloc[closest_idx]["loadcell_diff"] if "loadcell_diff" in amps_df.columns else np.nan
+            )
+            temp_2_val = amps_df.iloc[closest_idx]["zone_2_temp"] if "zone_2_temp" in amps_df.columns else np.nan
+            temp_3_val = amps_df.iloc[closest_idx]["zone_3_temp"] if "zone_3_temp" in amps_df.columns else np.nan
 
         # Get battery counts and cleanout info
         if window_size == -1:
@@ -383,9 +393,12 @@ def create_analysis_dataframe(amps_df, buckets_df, battery_cols, start_time, sam
         row = {
             "timestamp": timestamp,
             "motor_amps": motor_amps_val,
-            "zone_1_temp": temp_val,
+            "zone_1_temp": temp_1_val,
+            "zone_2_temp": temp_2_val,
+            "zone_3_temp": temp_3_val,
             "rpm": rpm_val,
             "kiln_weight": kiln_weight_val,
+            "loadcell_diff": loadcell_diff_val,
             "time_since_cleanout": time_since_cleanout,
             "total_batteries_since_cleanout": total_batteries_since_cleanout,
         }
@@ -500,7 +513,7 @@ def run():
     # Create safe column names with underscores
 
     # Use the create_analysis_dataframe function to generate analysis data
-    window_size = 60  # Use rolling window analysis
+    window_size = -1  # Use rolling window analysis
     STANDARDIZE = True
     analysis_df = create_analysis_dataframe(
         amps_df=amps_df,
