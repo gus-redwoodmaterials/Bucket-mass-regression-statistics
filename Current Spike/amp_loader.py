@@ -22,14 +22,18 @@ if not os.path.exists(DATA_FOLDER):
     os.makedirs(DATA_FOLDER)
 
 TAGS = {
-    "Motor amps": "RC1/4420-Calciner/4420-KLN-001-MTR-001_Current/Input".lower(),
-    "Small Mod Feed": "RC1/4420-Calciner/4420-CVR-001/Status/Speed_Feedback_Hz".lower(),
-    "Robot ON": "RC1/PLC8-Infeed_Robot/HMI/Feed_Robot_Mode/Value".lower(),
-    "RPM": "RC1/4420-Calciner/4420-KLN-001_RPM/Input".lower(),
-    "Kiln Weight": "RC1/4420-Calciner/4420-WT-0007_Alarm/Input".lower(),
-    "Large Mod Feed": "RC1/4420-Calciner/Module_Loading/HMI/Cycle_Time_Complete/Value".lower(),
-    "N2 Cons": "RC1/4420-Calciner/4420-FT-0001_Vol_Flow_Ave/Input".lower(),
-    "Zone 1 Temp": "RC1/4420-Calciner/4420-TE-7210-B_AI/Input_Scaled".lower(),
+    "motor_amps": "RC1/4420-Calciner/4420-KLN-001-MTR-001_Current/Input".lower(),
+    "small_mod_feed": "RC1/4420-Calciner/4420-CVR-001/Status/Speed_Feedback_Hz".lower(),
+    "robot_on": "RC1/PLC8-Infeed_Robot/HMI/Feed_Robot_Mode/Value".lower(),
+    "rpm": "RC1/4420-Calciner/4420-KLN-001_RPM/Input".lower(),
+    "kiln_weight": "RC1/4420-Calciner/4420-WT-0007_Alarm/Input".lower(),
+    "large_mod_feed": "RC1/4420-Calciner/Module_Loading/HMI/Cycle_Time_Complete/Value".lower(),
+    "n2_cons": "RC1/4420-Calciner/4420-FT-0001_Vol_Flow_Ave/Input".lower(),
+    "zone_1_temp": "RC1/4420-Calciner/4420-TE-7210-B_AI/Input_Scaled".lower(),
+    "zone_2_temp": "RC1/4420-Calciner/4420-TE-7220-B_AI/Input_Scaled".lower(),
+    "zone_3_temp": "RC1/4420-Calciner/4420-TE-7230-B_AI/Input_Scaled".lower(),
+    "load_cell_1": "RC1/4420-Calciner/4420-WT-0007/Status/S_RealTimeWeight".lower(),
+    "load_cell_3": "RC1/4420-Calciner/4420-WT-0009/Status/S_RealTimeWeight".lower(),
 }
 
 
@@ -96,7 +100,7 @@ def make_rpm_rolling_avg(df):
     Get rolling avg (per single rev) for all sensor values
     """
     t = df["timestamp"].to_numpy()
-    rpm = df["RPM"].to_numpy()
+    rpm = df["rpm"].to_numpy()
     angle = 0  # degrees
 
     t_avg = []
@@ -108,6 +112,9 @@ def make_rpm_rolling_avg(df):
     large_mod_feed_avg = []
     n2_cons_avg = []
     zone1_temp_avg = []
+    zone2_temp_avg = []
+    zone3_temp_avg = []
+    loadcell_diff_avg = []
 
     revs_complete = 0
     wt_rev = 0
@@ -118,14 +125,29 @@ def make_rpm_rolling_avg(df):
     large_mod_feed_rev = 0
     n2_cons_rev = 0
     zone1_temp_rev = 0
+    zone2_temp_rev = 0
+    zone3_temp_rev = 0
+    loadcell_diff_rev = 0
     num_pts_rev = 0
 
     for i in range(1, len(rpm)):
         angle += rpm[i] * (t[i] - t[i - 1]) / np.timedelta64(1, "s") / 60 * 360
 
-        wt_rev += df.iloc[i, df.columns.get_loc("Kiln Weight")]
+        wt_rev += df.iloc[i, df.columns.get_loc("kiln_weight")]
         rpm_rev += rpm[i]
-        motor_amps_rev += df.iloc[i, df.columns.get_loc("Motor amps")]
+        motor_amps_rev += df.iloc[i, df.columns.get_loc("motor_amps")]
+        zone1_temp_rev += df.iloc[i, df.columns.get_loc("zone_1_temp")]
+        # Add zone 2 and 3 temp
+        zone2_temp_rev += df.iloc[i, df.columns.get_loc("zone_2_temp")]
+        zone3_temp_rev += df.iloc[i, df.columns.get_loc("zone_3_temp")]
+        small_mod_feed_rev += df.iloc[i, df.columns.get_loc("small_mod_feed")]
+        robot_on_rev += df.iloc[i, df.columns.get_loc("robot_on")]
+        large_mod_feed_rev += df.iloc[i, df.columns.get_loc("large_mod_feed")]
+        n2_cons_rev += df.iloc[i, df.columns.get_loc("n2_cons")]
+        # Add load cell diff
+        loadcell1 = df.iloc[i, df.columns.get_loc("load_cell_1")]
+        loadcell3 = df.iloc[i, df.columns.get_loc("load_cell_3")]
+        loadcell_diff_rev += loadcell1 - loadcell3
         num_pts_rev += 1
 
         if angle >= 360 * (revs_complete + 1):
@@ -139,6 +161,9 @@ def make_rpm_rolling_avg(df):
             large_mod_feed_avg.append(large_mod_feed_rev / num_pts_rev)
             n2_cons_avg.append(n2_cons_rev / num_pts_rev)
             zone1_temp_avg.append(zone1_temp_rev / num_pts_rev)
+            zone2_temp_avg.append(zone2_temp_rev / num_pts_rev)
+            zone3_temp_avg.append(zone3_temp_rev / num_pts_rev)
+            loadcell_diff_avg.append(loadcell_diff_rev / num_pts_rev)
 
             wt_rev = 0
             rpm_rev = 0
@@ -148,13 +173,25 @@ def make_rpm_rolling_avg(df):
             large_mod_feed_rev = 0
             n2_cons_rev = 0
             zone1_temp_rev = 0
+            zone2_temp_rev = 0
+            zone3_temp_rev = 0
+            loadcell_diff_rev = 0
             num_pts_rev = 0
 
     df_avg = pd.DataFrame(
         {
             "timestamp": np.array(t_avg),
-            "Kiln Weight": np.array(wt_avg),
-            "Avg_Motor_Amps": np.array(motor_amps_avg),
+            "kiln_weight": np.array(wt_avg),
+            "motor_amps": np.array(motor_amps_avg),
+            "rpm": np.array(rpm_avg),
+            "zone_1_temp": np.array(zone1_temp_avg),
+            "zone_2_temp": np.array(zone2_temp_avg),
+            "zone_3_temp": np.array(zone3_temp_avg),
+            "small_mod_feed": np.array(small_mod_feed_avg),
+            "robot_on": np.array(robot_on_avg),
+            "large_mod_feed": np.array(large_mod_feed_avg),
+            "n2_cons": np.array(n2_cons_avg),
+            "loadcell_diff": np.array(loadcell_diff_avg),
         }
     )
 
@@ -183,16 +220,24 @@ def run():
     df_labeled["source"] = "raw"
     df_avg_labeled = df_avg.copy()
     df_avg_labeled["source"] = "avg"
+    print(df_avg_labeled.head())
 
     # Align columns for concatenation
     all_cols = sorted(set(df_labeled.columns) | set(df_avg_labeled.columns))
     df_labeled = df_labeled.reindex(columns=all_cols)
     df_avg_labeled = df_avg_labeled.reindex(columns=all_cols)
 
+    mask = (df_avg["rpm"] < 0.08) & (df_avg["kiln_weight"] < 700)
+    df_avg = df_avg[~mask]
+
     # Concatenate and write to CSV
-    combined = pd.concat([df_labeled, df_avg_labeled], ignore_index=True)
-    combined.to_csv("motor_amps.csv", index=False)
-    print("Wrote both raw and averaged data to motor_amps.csv")
+    combined = pd.concat([df_labeled, df_avg], ignore_index=True)
+    # Write df_avg to the Current Data folder
+    output_dir = "Current Spike/Current Data"
+    os.makedirs(output_dir, exist_ok=True)
+    avg_out_path = os.path.join(output_dir, "updated_avg_motor_current.csv")
+    df_avg.to_csv(avg_out_path, index=False)
+    print(f"Wrote averaged data to {avg_out_path}")
 
 
 if __name__ == "__main__":

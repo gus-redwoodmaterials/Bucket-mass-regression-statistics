@@ -12,6 +12,7 @@ from statsmodels.formula.api import ols
 from statsmodels.stats.anova import anova_lm
 from sklearn.preprocessing import StandardScaler
 
+STANDARDIZE = False  # Set to True to use cumulative battery counts instead of rolling window
 
 CLEANOUTS = pd.to_datetime(
     [
@@ -422,6 +423,7 @@ def run_standardised_regression(
     model_std  : statsmodels RegressionResultsWrapper
     beta_table : pd.DataFrame   # tidy view of standardised betas
     """
+    STANDARDIZE = True  # Ensure we are standardizing predictors
     if category_predictors is None:
         category_predictors = [c for c in analysis_df.columns if c.startswith("cat_")]
 
@@ -441,10 +443,12 @@ def run_standardised_regression(
     model_std = sm.OLS(y, X_z).fit(cov_type="HC3")
 
     # ---- 3.  Tidy summary of standardised betas -----------------------------
+    # Get p-values for each predictor (excluding intercept)
+    pvalues = model_std.pvalues.drop("const")
     beta = (
         model_std.params.drop("const")  # we don’t rank the intercept
         .to_frame("beta_std")
-        .assign(abs_beta=lambda d: d["beta_std"].abs())
+        .assign(abs_beta=lambda d: d["beta_std"].abs(), p_value=pvalues)
         .sort_values("abs_beta", ascending=False)
     )
 
@@ -463,7 +467,7 @@ def run_standardised_regression(
 def run():
     # Load data
     buckets_df = pd.read_csv("Current Spike/Current Data/scout_buckets_dataset_with_categories.csv")
-    amps_df = pd.read_csv("Current Spike/Current Data/avg_motor_current.csv")
+    amps_df = pd.read_csv("Current Spike/Current Data/updated_avg_motor_current.csv")
 
     # After loading the data, sanitize column names
     buckets_df.columns = (
@@ -495,17 +499,16 @@ def run():
     battery_cols = [c for c in buckets_df.columns if c not in non_battery_cols]
     # Create safe column names with underscores
 
-    # Print info for debugging
-    print(f"First few battery columns: {battery_cols[:5]}")
-
     # Use the create_analysis_dataframe function to generate analysis data
+    window_size = 60  # Use rolling window analysis
+    STANDARDIZE = True
     analysis_df = create_analysis_dataframe(
         amps_df=amps_df,
         buckets_df=buckets_df,
         battery_cols=battery_cols,  # Pass the underscore versions
         start_time=start_time,
         sample_interval="1T",  # 1 minute interval - adjust as needed
-        window_size=60,  # Use cumulative sum of all batteries up to each timestamp with cleanouts
+        window_size=window_size,  # Use rolling window
     )
     analysis_df.columns = (
         analysis_df.columns.str.replace("`", "", regex=False)
@@ -514,6 +517,8 @@ def run():
         .str.replace("/", "_")
         .str.lower()
     )
+    # mask = (analysis_df["rpm"] < 0.08) & (analysis_df["kiln_weight"] < 700)
+    # analysis_df = analysis_df[~mask]  # Remove rows where rpm < 0.08 and kiln_weight < 700
 
     if len(analysis_df) > 0:
         print(f"\nCreated dataset with {len(analysis_df)} rows and {len(analysis_df.columns)} columns")
@@ -522,25 +527,64 @@ def run():
         # Calculate correlations between motor amps and each battery type
         correlations, sorted_correlations = calculate_category_correlations(analysis_df, investigation_cols)
 
-        # Write correlation results to CSV
-        corr_df = pd.DataFrame(
-            [
-                {
-                    "Type": type_name,
-                    "Correlation": stats["correlation"],
-                    "Data Points": stats["data_points"],
-                    "Avg Count": stats["avg_count"],
-                    "Avg Amps": stats["avg_amps"],
-                }
-                for type_name, stats in sorted_correlations
-            ]
-        )
-        corr_df.to_csv("battery_type_correlations.csv", index=False)
-        print("Correlation results written to battery_type_correlations.csv")
+        # --- Plot: Feed rate of battery type containing '312' and motor_amps as time series (masked 7/1 to 7/5) ---
+
+        # Find the battery column containing '312'
+        # battery_col_312 = next((col for col in analysis_df.columns if "312" in col), None)
+        # if battery_col_312:
+        #     bat_name = battery_col_312
+        #     battery_col_312 = "Ultium 312"  # Clean up any whitespace
+        #     # Mask for 7/1 to 7/5 (2025) with explicit UTC localization
+        #     start_dt = pd.to_datetime("2025-07-01").tz_localize("UTC")
+        #     end_dt = pd.to_datetime("2025-07-04").tz_localize("UTC")
+        #     mask = (analysis_df["timestamp"] >= start_dt) & (analysis_df["timestamp"] < end_dt)
+        #     df_masked = analysis_df.loc[mask]
+        #     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+        #     ax1.plot(
+        #         df_masked["timestamp"],
+        #         df_masked[bat_name],
+        #         label=f"Feedrate of {battery_col_312} per hour",
+        #         color="tab:blue",
+        #     )
+        #     ax1.set_ylabel(f"Feedrate {battery_col_312}", fontsize=14)
+        #     ax1.legend(loc="upper right")
+        #     ax1.grid(True)
+
+        #     ax2.plot(df_masked["timestamp"], df_masked["motor_amps"], label="Motor Amps", color="tab:orange")
+        #     ax2.set_ylabel("Motor Amps / Rev", fontsize=14)
+        #     ax2.set_xlabel("Timestamp", fontsize=14)
+        #     ax2.legend(loc="upper right")
+        #     ax2.grid(True)
+
+        #     # Plot RPM (left y-axis, red) and Kiln Weight (right y-axis, green) on the same subplot
+        #     ax3a = ax3
+        #     ax3b = ax3.twinx()
+        #     l1 = ax3a.plot(df_masked["timestamp"], df_masked["rpm"], label="RPM", color="tab:red")
+        #     l2 = ax3b.plot(df_masked["timestamp"], df_masked["kiln_weight"], label="Kiln Weight", color="tab:green")
+        #     ax3a.set_ylabel("RPM", fontsize=14, color="tab:red")
+        #     ax3b.set_ylabel("Kiln Weight", fontsize=14, color="tab:green")
+        #     ax3a.tick_params(axis="y", labelcolor="tab:red")
+        #     ax3b.tick_params(axis="y", labelcolor="tab:green")
+        #     # Combine legends
+        #     lines = l1 + l2
+        #     labels = [line.get_label() for line in lines]
+        #     ax3a.legend(lines, labels, loc="upper right")
+        #     ax3a.grid(True)
+
+        #     plt.suptitle(f"Time Series (7/1-7/5): {battery_col_312} Feedrate and Motor Amps", fontsize=18)
+        #     plt.tight_layout(rect=(0, 0.03, 1, 0.97))
+        #     plt.show()
+        # else:
+        #     print("No battery column containing '312' found in analysis_df.")
+
+        # Determine analysis type for filename
+        analysis_type = "cumulative" if window_size == -1 else "lookback"
+        results_folder = "Current Spike/results"
+        os.makedirs(results_folder, exist_ok=True)
 
         # Define predictors for regression
         # Only include time_since_cleanout and total_batteries_since_cleanout if they exist and are not all NaN
-        base_predictors = ["rpm", "zone_1_temp", "kiln_weight"]
+        base_predictors = ["rpm", "zone_1_temp", "zone_2_temp", "zone_3_temp", "kiln_weight", "loadcell_diff"]
         if "time_since_cleanout" in analysis_df.columns and not analysis_df["time_since_cleanout"].isna().all():
             base_predictors.append("time_since_cleanout")
         if (
@@ -550,16 +594,31 @@ def run():
             base_predictors.append("total_batteries_since_cleanout")
 
         # Run multiple linear regression
-        model_std, beta_tbl = run_standardised_regression(
-            analysis_df=analysis_df,
-            base_predictors=base_predictors,
-            category_predictors=investigation_cols,
-            print_results=True,
-        )
+        # CHANGE ME!
+        if STANDARDIZE:
+            print("\nRunning standardised regression...")
+            model_std, beta_tbl = run_standardised_regression(
+                analysis_df=analysis_df,
+                base_predictors=base_predictors,
+                category_predictors=investigation_cols,
+                print_results=True,
+            )
+        else:
+            print("\nRunning regular regression...")
+            model_std, beta_tbl = run_multiple_linear_regression(
+                analysis_df=analysis_df,
+                base_predictors=base_predictors,
+                category_predictors=investigation_cols,
+                print_results=True,
+            )
+
+        # Add standardized flag to filename if applicable
+        standardized_suffix = "_standardized" if STANDARDIZE else ""
 
         # Write standardised regression coefficients to CSV
-        beta_tbl.to_csv("regression_impacts.csv", index=True)
-        print("Standardised regression results written to regression_impacts.csv")
+        regression_filename = f"{results_folder}/scout_{analysis_type}{standardized_suffix}_regression_impacts.csv"
+        beta_tbl.to_csv(regression_filename, index=True)
+        print(f"Standardised regression results written to {regression_filename}")
 
 
 if __name__ == "__main__":
