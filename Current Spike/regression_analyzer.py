@@ -13,7 +13,7 @@ def run():
     for fname in all_files:
         fpath = os.path.join(results_folder, fname)
         df = pd.read_csv(fpath)
-        if "material" in fname or "cumulative" not in fname:
+        if "material" in fname:
             continue
         if "standardized" in fname:
             # Rename 'beta_std' to 'impact' if present
@@ -23,7 +23,6 @@ def run():
         dfs[fname] = df
 
     print(dfs.keys())
-    # Aggregate r100 variables across all standardized files
     impacts = {}
     ignore = []
     for fname, df in dfs.items():
@@ -52,6 +51,16 @@ def run():
                     impacts[prefix].append(impact_val)
                 except Exception:
                     pass
+            else:
+                p_value = row.get("p_value", None)
+                impact = row.get("impact", None)
+                if impact < 0:
+                    ignore.append(prefix)
+                    if prefix in impacts:
+                        del impacts[prefix]
+                    continue
+                if p_value is not None and p_value > 0.05:
+                    impacts[prefix].append(float(impact))
 
     # --- Bar chart of standardized regression impacts for all variables ---
 
@@ -60,7 +69,7 @@ def run():
         if impacts.get(battery) is None:
             continue
         if len(impacts[battery]) > 0:
-            impacts[battery] = np.median(impacts[battery])
+            impacts[battery] = np.mean(impacts[battery])
         else:
             del impacts[battery]
             continue

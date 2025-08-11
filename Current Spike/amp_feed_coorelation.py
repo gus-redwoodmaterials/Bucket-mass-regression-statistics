@@ -630,7 +630,8 @@ def run():
 
         # Write standardised regression coefficients to CSV
         regression_filename = f"{results_folder}/scout_{analysis_type}{standardized_suffix}_regression_impacts.csv"
-        beta_tbl.to_csv(regression_filename, index=True)
+        beta_tbl_out = beta_tbl.reset_index().rename(columns={beta_tbl.index.name or "index": "var"})
+        beta_tbl_out.to_csv(regression_filename, index=True)
         print(f"Standardised regression results written to {regression_filename}")
 
 

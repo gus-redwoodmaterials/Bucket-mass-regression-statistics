@@ -322,7 +322,7 @@ def run():
     buckets_df = buckets_df.set_index("transaction_time_utc")
 
     # Define analysis type for naming
-    window_size = 60
+    window_size = -1
     analysis_df = create_analysis_dataframe(
         amps_df, buckets_df, battery_cols, start_time, sample_interval="1T", window_size=window_size
     )
@@ -369,7 +369,9 @@ def run():
         regression_filename = (
             f"{results_folder}/material_trans_{analysis_type}{standardized_suffix}_regression_impacts.csv"
         )
-        beta_tbl.to_csv(regression_filename, index=True)
+        # Write index as 'var' column
+        beta_tbl_out = beta_tbl.reset_index().rename(columns={beta_tbl.index.name or 'index': 'var'})
+        beta_tbl_out.to_csv(regression_filename, index=False)
         print(f"Standardised regression results written to {regression_filename}")
 
 
