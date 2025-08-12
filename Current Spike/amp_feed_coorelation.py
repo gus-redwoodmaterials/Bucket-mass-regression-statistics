@@ -14,23 +14,33 @@ from sklearn.preprocessing import StandardScaler
 
 STANDARDIZE = False  # Set to True to use cumulative battery counts instead of rolling window
 
+import pandas as pd
+
+# Existing manual cleanouts (already at 12:00 UTC)
 CLEANOUTS = pd.to_datetime(
     [
-        "2025-06-02 12:00",
-        "2025-06-03 12:00",
-        "2025-06-22 12:00",
-        "2025-06-24 12:00",
-        "2025-06-25 12:00",
-        "2025-07-03 12:00",
-        "2025-07-08 12:00",
-        "2025-07-12 12:00",
-        "2025-07-15 12:00",
-        "2025-07-21 12:00",
-        "2025-07-23 12:00",
-        "2025-07-25 12:00",
-        "2025-07-29 12:00",
-    ]
-).tz_localize("utc")
+        "2025-06-02 7:00",
+        "2025-06-03 7:00",
+        "2025-06-22 7:00",
+        "2025-06-24 7:00",
+        "2025-06-25 7:00",  # Wed
+        "2025-07-03 7:00",
+        "2025-07-08 7:00",
+        "2025-07-12 7:00",
+        "2025-07-15 7:00",
+        "2025-07-21 7:00",
+        "2025-07-23 7:00",  # Wed
+        "2025-07-25 7:00",
+        "2025-07-29 7:00",
+    ],
+    utc=True,  # same as tz_localize("UTC") after parse
+)
+
+# All Wednesdays in the range, at **7:00 UTC**
+WEDNESDAYS = pd.date_range(start="2025-06-04", end="2025-08-04", freq="W-WED", tz="UTC") + pd.Timedelta(hours=7)
+
+# Union (unique + sorted) instead of concat
+CLEANOUTS = CLEANOUTS.union(WEDNESDAYS).sort_values()
 
 
 def count_batteries_per_window(
@@ -477,6 +487,48 @@ def run_standardised_regression(
     return model_std, beta
 
 
+def two_stage_regression(analysis_df, battery_cols, print_results=True):
+    # 1. First regression: motor_amps ~ kiln_weight + rpm (standardized)
+    scaler_main = StandardScaler()
+    X_main_raw = analysis_df[["kiln_weight", "rpm"]]
+    X_main = scaler_main.fit_transform(X_main_raw)
+    X_main = sm.add_constant(X_main)
+    y = analysis_df["motor_amps"]
+    model_main = sm.OLS(y, X_main).fit()
+    if print_results:
+        print("\n--- Stage 1: Main effects (kiln_weight, rpm, standardized) ---")
+        print(model_main.summary())
+
+    # 2. Get residuals
+    residuals = y - model_main.predict(X_main)
+
+    # 3. Second regression: residuals ~ battery types (standardized)
+    scaler_batt = StandardScaler()
+    X_battery_raw = analysis_df[battery_cols]
+    X_battery_scaled = scaler_batt.fit_transform(X_battery_raw)
+    X_battery = pd.DataFrame(X_battery_scaled, columns=battery_cols, index=analysis_df.index)
+    X_battery = sm.add_constant(X_battery)
+    model_battery = sm.OLS(residuals, X_battery).fit()
+    # Build tidy summary table for battery coefficients (skip intercept)
+    params = model_battery.params.drop("const")
+    pvalues = model_battery.pvalues.drop("const")
+    beta_tbl = (
+        params.to_frame("beta_std")
+        .assign(abs_beta=lambda d: d["beta_std"].abs(), p_value=pvalues)
+        .sort_values("abs_beta", ascending=False)
+    )
+    if print_results:
+        print("\n--- Stage 2: Battery types on residuals (standardized) ---")
+        print("Top battery predictors by |β| (amps per 1 SD move):")
+        print(beta_tbl.head(10).to_string(float_format=lambda x: f"{x:8.3f}"))
+        print(
+            f"\nModel R²: {model_battery.rsquared:.3f}   Adj R²: {model_battery.rsquared_adj:.3f}   n = {int(model_battery.nobs)}"
+        )
+
+    # Return beta_tbl for writing outside the function
+    return model_main, model_battery, beta_tbl
+
+
 def run():
     # Load data
     buckets_df = pd.read_csv("Current Spike/Current Data/scout_buckets_dataset_with_categories.csv")
@@ -513,7 +565,7 @@ def run():
     # Create safe column names with underscores
 
     # Use the create_analysis_dataframe function to generate analysis data
-    window_size = -1  # Use rolling window analysis
+    window_size = 60  # Use rolling window analysis
     STANDARDIZE = True
     analysis_df = create_analysis_dataframe(
         amps_df=amps_df,
@@ -543,52 +595,74 @@ def run():
         # --- Plot: Feed rate of battery type containing '312' and motor_amps as time series (masked 7/1 to 7/5) ---
 
         # Find the battery column containing '312'
-        # battery_col_312 = next((col for col in analysis_df.columns if "312" in col), None)
-        # if battery_col_312:
-        #     bat_name = battery_col_312
-        #     battery_col_312 = "Ultium 312"  # Clean up any whitespace
-        #     # Mask for 7/1 to 7/5 (2025) with explicit UTC localization
-        #     start_dt = pd.to_datetime("2025-07-01").tz_localize("UTC")
-        #     end_dt = pd.to_datetime("2025-07-04").tz_localize("UTC")
-        #     mask = (analysis_df["timestamp"] >= start_dt) & (analysis_df["timestamp"] < end_dt)
-        #     df_masked = analysis_df.loc[mask]
-        #     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
-        #     ax1.plot(
-        #         df_masked["timestamp"],
-        #         df_masked[bat_name],
-        #         label=f"Feedrate of {battery_col_312} per hour",
-        #         color="tab:blue",
-        #     )
-        #     ax1.set_ylabel(f"Feedrate {battery_col_312}", fontsize=14)
-        #     ax1.legend(loc="upper right")
-        #     ax1.grid(True)
+        time_accumulation = [col for col in analysis_df.columns if "time_since_cleanout" in col]
+        SHOW_THIRD_AX = False  # Toggle this to show/hide the third subplot
+        if time_accumulation:
+            bat_name = time_accumulation
+            # Mask for 7/1 to 7/5 (2025) with explicit UTC localization
+            start_dt = analysis_df["timestamp"].min()
+            end_dt = analysis_df["timestamp"].max()
+            mask = (analysis_df["timestamp"] >= start_dt) & (analysis_df["timestamp"] < end_dt)
+            df_masked = analysis_df.loc[mask]
+            if SHOW_THIRD_AX:
+                fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+            else:
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
-        #     ax2.plot(df_masked["timestamp"], df_masked["motor_amps"], label="Motor Amps", color="tab:orange")
-        #     ax2.set_ylabel("Motor Amps / Rev", fontsize=14)
-        #     ax2.set_xlabel("Timestamp", fontsize=14)
-        #     ax2.legend(loc="upper right")
-        #     ax2.grid(True)
+            ax1.plot(
+                df_masked["timestamp"],
+                df_masked[bat_name],
+                label="Time Since Cleanout",
+                color="tab:blue",
+            )
+            # Add vertical lines for each cleanout
+            # Ensure CLEANOUTS is iterable
+            if hasattr(CLEANOUTS, "__iter__") and not isinstance(CLEANOUTS, (str, bytes, pd.Timestamp)):
+                cleanout_list = list(CLEANOUTS)
+            else:
+                cleanout_list = [CLEANOUTS]
+            for i, cleanout_time in enumerate(cleanout_list):
+                if cleanout_time >= df_masked["timestamp"].min() and cleanout_time <= df_masked["timestamp"].max():
+                    ax1.axvline(
+                        cleanout_time, color="k", linestyle="--", alpha=0.7, label="Cleanout" if i == 0 else None
+                    )
+            ax1.set_ylabel("Time Since Cleanout (min)", fontsize=14)
+            ax1.legend(loc="upper right")
+            ax1.grid(True)
 
-        #     # Plot RPM (left y-axis, red) and Kiln Weight (right y-axis, green) on the same subplot
-        #     ax3a = ax3
-        #     ax3b = ax3.twinx()
-        #     l1 = ax3a.plot(df_masked["timestamp"], df_masked["rpm"], label="RPM", color="tab:red")
-        #     l2 = ax3b.plot(df_masked["timestamp"], df_masked["kiln_weight"], label="Kiln Weight", color="tab:green")
-        #     ax3a.set_ylabel("RPM", fontsize=14, color="tab:red")
-        #     ax3b.set_ylabel("Kiln Weight", fontsize=14, color="tab:green")
-        #     ax3a.tick_params(axis="y", labelcolor="tab:red")
-        #     ax3b.tick_params(axis="y", labelcolor="tab:green")
-        #     # Combine legends
-        #     lines = l1 + l2
-        #     labels = [line.get_label() for line in lines]
-        #     ax3a.legend(lines, labels, loc="upper right")
-        #     ax3a.grid(True)
+            ax2.plot(df_masked["timestamp"], df_masked["motor_amps"], label="Motor Amps", color="tab:orange")
+            # Add vertical lines for each cleanout
+            for i, cleanout_time in enumerate(cleanout_list):
+                if cleanout_time >= df_masked["timestamp"].min() and cleanout_time <= df_masked["timestamp"].max():
+                    ax2.axvline(
+                        cleanout_time, color="k", linestyle="--", alpha=0.7, label="Cleanout" if i == 0 else None
+                    )
+            ax2.set_ylabel("Motor Amps / Rev", fontsize=14)
+            ax2.set_xlabel("Timestamp", fontsize=14)
+            ax2.legend(loc="upper right")
+            ax2.grid(True)
 
-        #     plt.suptitle(f"Time Series (7/1-7/5): {battery_col_312} Feedrate and Motor Amps", fontsize=18)
-        #     plt.tight_layout(rect=(0, 0.03, 1, 0.97))
-        #     plt.show()
-        # else:
-        #     print("No battery column containing '312' found in analysis_df.")
+            if SHOW_THIRD_AX:
+                # Plot RPM (left y-axis, red) and Kiln Weight (right y-axis, green) on the same subplot
+                ax3a = ax3
+                ax3b = ax3.twinx()
+                l1 = ax3a.plot(df_masked["timestamp"], df_masked["rpm"], label="RPM", color="tab:red")
+                l2 = ax3b.plot(df_masked["timestamp"], df_masked["kiln_weight"], label="Kiln Weight", color="tab:green")
+                ax3a.set_ylabel("RPM", fontsize=14, color="tab:red")
+                ax3b.set_ylabel("Kiln Weight", fontsize=14, color="tab:green")
+                ax3a.tick_params(axis="y", labelcolor="tab:red")
+                ax3b.tick_params(axis="y", labelcolor="tab:green")
+                # Combine legends
+                lines = l1 + l2
+                labels = [line.get_label() for line in lines]
+                ax3a.legend(lines, labels, loc="upper right")
+                ax3a.grid(True)
+
+            plt.suptitle("Time Series: Time Since Cleanout and Motor Amps", fontsize=18)
+            plt.tight_layout(rect=(0, 0.03, 1, 0.97))
+            plt.show()
+        else:
+            print("No time since cleanout column found in analysis_df.")
 
         # Determine analysis type for filename
         analysis_type = "cumulative" if window_size == -1 else "lookback"
@@ -625,14 +699,24 @@ def run():
                 print_results=True,
             )
 
+        # Run two-stage regression and write results to CSV with descriptive filename
+        model_main, model_battery, two_stage_beta_tbl = two_stage_regression(
+            analysis_df=analysis_df,
+            battery_cols=investigation_cols,
+            print_results=True,
+        )
+
         # Add standardized flag to filename if applicable
         standardized_suffix = "_standardized" if STANDARDIZE else ""
-
-        # Write standardised regression coefficients to CSV
-        regression_filename = f"{results_folder}/scout_{analysis_type}{standardized_suffix}_regression_impacts.csv"
-        beta_tbl_out = beta_tbl.reset_index().rename(columns={beta_tbl.index.name or "index": "var"})
-        beta_tbl_out.to_csv(regression_filename, index=True)
-        print(f"Standardised regression results written to {regression_filename}")
+        # Use analysis_type for filename
+        battery_regression_filename = (
+            f"{results_folder}/scout_two_stage_battery_regression_{analysis_type}{standardized_suffix}.csv"
+        )
+        two_stage_beta_tbl_out = two_stage_beta_tbl.reset_index().rename(
+            columns={two_stage_beta_tbl.index.name or "index": "var"}
+        )
+        two_stage_beta_tbl_out.to_csv(battery_regression_filename, index=False)
+        print(f"Two-stage battery regression results written to {battery_regression_filename}")
 
 
 if __name__ == "__main__":
