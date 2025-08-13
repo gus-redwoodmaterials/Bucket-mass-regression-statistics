@@ -525,8 +525,8 @@ def two_stage_regression(analysis_df, battery_cols, print_results=True):
             f"\nModel R²: {model_battery.rsquared:.3f}   Adj R²: {model_battery.rsquared_adj:.3f}   n = {int(model_battery.nobs)}"
         )
 
-    # Return beta_tbl for writing outside the function
-    return model_main, model_battery, beta_tbl
+    # Return residuals for adding to analysis_df externally
+    return model_main, model_battery, beta_tbl, residuals
 
 
 def run():
@@ -565,7 +565,7 @@ def run():
     # Create safe column names with underscores
 
     # Use the create_analysis_dataframe function to generate analysis data
-    window_size = 60  # Use rolling window analysis
+    window_size = -1  # Use rolling window analysis
     STANDARDIZE = True
     analysis_df = create_analysis_dataframe(
         amps_df=amps_df,
@@ -595,74 +595,6 @@ def run():
         # --- Plot: Feed rate of battery type containing '312' and motor_amps as time series (masked 7/1 to 7/5) ---
 
         # Find the battery column containing '312'
-        time_accumulation = [col for col in analysis_df.columns if "time_since_cleanout" in col]
-        SHOW_THIRD_AX = False  # Toggle this to show/hide the third subplot
-        if time_accumulation:
-            bat_name = time_accumulation
-            # Mask for 7/1 to 7/5 (2025) with explicit UTC localization
-            start_dt = analysis_df["timestamp"].min()
-            end_dt = analysis_df["timestamp"].max()
-            mask = (analysis_df["timestamp"] >= start_dt) & (analysis_df["timestamp"] < end_dt)
-            df_masked = analysis_df.loc[mask]
-            if SHOW_THIRD_AX:
-                fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
-            else:
-                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-
-            ax1.plot(
-                df_masked["timestamp"],
-                df_masked[bat_name],
-                label="Time Since Cleanout",
-                color="tab:blue",
-            )
-            # Add vertical lines for each cleanout
-            # Ensure CLEANOUTS is iterable
-            if hasattr(CLEANOUTS, "__iter__") and not isinstance(CLEANOUTS, (str, bytes, pd.Timestamp)):
-                cleanout_list = list(CLEANOUTS)
-            else:
-                cleanout_list = [CLEANOUTS]
-            for i, cleanout_time in enumerate(cleanout_list):
-                if cleanout_time >= df_masked["timestamp"].min() and cleanout_time <= df_masked["timestamp"].max():
-                    ax1.axvline(
-                        cleanout_time, color="k", linestyle="--", alpha=0.7, label="Cleanout" if i == 0 else None
-                    )
-            ax1.set_ylabel("Time Since Cleanout (min)", fontsize=14)
-            ax1.legend(loc="upper right")
-            ax1.grid(True)
-
-            ax2.plot(df_masked["timestamp"], df_masked["motor_amps"], label="Motor Amps", color="tab:orange")
-            # Add vertical lines for each cleanout
-            for i, cleanout_time in enumerate(cleanout_list):
-                if cleanout_time >= df_masked["timestamp"].min() and cleanout_time <= df_masked["timestamp"].max():
-                    ax2.axvline(
-                        cleanout_time, color="k", linestyle="--", alpha=0.7, label="Cleanout" if i == 0 else None
-                    )
-            ax2.set_ylabel("Motor Amps / Rev", fontsize=14)
-            ax2.set_xlabel("Timestamp", fontsize=14)
-            ax2.legend(loc="upper right")
-            ax2.grid(True)
-
-            if SHOW_THIRD_AX:
-                # Plot RPM (left y-axis, red) and Kiln Weight (right y-axis, green) on the same subplot
-                ax3a = ax3
-                ax3b = ax3.twinx()
-                l1 = ax3a.plot(df_masked["timestamp"], df_masked["rpm"], label="RPM", color="tab:red")
-                l2 = ax3b.plot(df_masked["timestamp"], df_masked["kiln_weight"], label="Kiln Weight", color="tab:green")
-                ax3a.set_ylabel("RPM", fontsize=14, color="tab:red")
-                ax3b.set_ylabel("Kiln Weight", fontsize=14, color="tab:green")
-                ax3a.tick_params(axis="y", labelcolor="tab:red")
-                ax3b.tick_params(axis="y", labelcolor="tab:green")
-                # Combine legends
-                lines = l1 + l2
-                labels = [line.get_label() for line in lines]
-                ax3a.legend(lines, labels, loc="upper right")
-                ax3a.grid(True)
-
-            plt.suptitle("Time Series: Time Since Cleanout and Motor Amps", fontsize=18)
-            plt.tight_layout(rect=(0, 0.03, 1, 0.97))
-            plt.show()
-        else:
-            print("No time since cleanout column found in analysis_df.")
 
         # Determine analysis type for filename
         analysis_type = "cumulative" if window_size == -1 else "lookback"
@@ -700,10 +632,15 @@ def run():
             )
 
         # Run two-stage regression and write results to CSV with descriptive filename
-        model_main, model_battery, two_stage_beta_tbl = two_stage_regression(
+        model_main, model_battery, two_stage_beta_tbl, stage1_residuals = two_stage_regression(
             analysis_df=analysis_df,
             battery_cols=investigation_cols,
             print_results=True,
+        )
+
+        # Add residuals from stage 1 to analysis_df for later plotting
+        analysis_df["residual_stage1"] = (
+            stage1_residuals.values if hasattr(stage1_residuals, "values") else stage1_residuals
         )
 
         # Add standardized flag to filename if applicable
@@ -717,6 +654,12 @@ def run():
         )
         two_stage_beta_tbl_out.to_csv(battery_regression_filename, index=False)
         print(f"Two-stage battery regression results written to {battery_regression_filename}")
+
+        # Save analysis_df for external plotting (include lookback / cumulative info)
+        analysis_descriptor = "cumulative" if window_size == -1 else f"lookback_{window_size}min"
+        analysis_df_filename = f"{results_folder}/scout_analysis_df_{analysis_descriptor}{standardized_suffix}.csv"
+        analysis_df.to_csv(analysis_df_filename, index=False)
+        print(f"analysis_df written to {analysis_df_filename}")
 
 
 if __name__ == "__main__":

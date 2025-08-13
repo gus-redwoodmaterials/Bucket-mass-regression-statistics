@@ -7,6 +7,7 @@ from dateutil.parser import parse
 from rw_data_science_utils.athena_download import athena_download
 import matplotlib.pyplot as plt
 import warnings
+import matplotlib.pyplot as plt
 
 # Suppress all FutureWarning messages
 warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -54,6 +55,9 @@ def load_data(start_date_str, end_date_str, description="data"):
         print(f"Loading from cache: {csv_filename}")
         df = pd.read_csv(csv_path)
         df["timestamp"] = pd.to_datetime(df["timestamp"])
+        # zero_start = pd.Timestamp("2025-07-17 04:30", tz="UTC")
+        # zero_end = pd.Timestamp("2025-07-22 07:30", tz="UTC")
+        # df = loadcell_dif_zeroer(df, zero_start, zero_end)
 
         # Check if averaged data exists
         if os.path.exists(csv_avg_path):
@@ -78,6 +82,10 @@ def load_data(start_date_str, end_date_str, description="data"):
                 DATA_TIMESTEP_SECONDS,
             )
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+            # zero_start = pd.Timestamp("2025-07-17 04:30", tz="UTC")
+            # zero_end = pd.Timestamp("2025-07-22 07:30", tz="UTC")
+            # df = loadcell_dif_zeroer(df, zero_start, zero_end)
             df.to_csv(csv_path, index=False)
             print(f"Cached: {csv_filename}")
 
@@ -115,6 +123,10 @@ def make_rpm_rolling_avg(df):
     zone2_temp_avg = []
     zone3_temp_avg = []
     loadcell_diff_avg = []
+    load_cell_1_avg = []
+    load_cell_3_avg = []
+    load_cell_1_rev = 0
+    load_cell_3_rev = 0
 
     revs_complete = 0
     wt_rev = 0
@@ -145,9 +157,9 @@ def make_rpm_rolling_avg(df):
         large_mod_feed_rev += df.iloc[i, df.columns.get_loc("large_mod_feed")]
         n2_cons_rev += df.iloc[i, df.columns.get_loc("n2_cons")]
         # Add load cell diff
-        loadcell1 = df.iloc[i, df.columns.get_loc("load_cell_1")]
-        loadcell3 = df.iloc[i, df.columns.get_loc("load_cell_3")]
-        loadcell_diff_rev += loadcell1 - loadcell3
+        load_cell_1_rev += df.iloc[i, df.columns.get_loc("load_cell_1")]
+        load_cell_3_rev += df.iloc[i, df.columns.get_loc("load_cell_3")]
+
         num_pts_rev += 1
 
         if angle >= 360 * (revs_complete + 1):
@@ -163,7 +175,8 @@ def make_rpm_rolling_avg(df):
             zone1_temp_avg.append(zone1_temp_rev / num_pts_rev)
             zone2_temp_avg.append(zone2_temp_rev / num_pts_rev)
             zone3_temp_avg.append(zone3_temp_rev / num_pts_rev)
-            loadcell_diff_avg.append(loadcell_diff_rev / num_pts_rev)
+            load_cell_1_avg.append(load_cell_1_rev / num_pts_rev)
+            load_cell_3_avg.append(load_cell_3_rev / num_pts_rev)
 
             wt_rev = 0
             rpm_rev = 0
@@ -175,7 +188,8 @@ def make_rpm_rolling_avg(df):
             zone1_temp_rev = 0
             zone2_temp_rev = 0
             zone3_temp_rev = 0
-            loadcell_diff_rev = 0
+            load_cell_1_rev = 0
+            load_cell_3_rev = 0
             num_pts_rev = 0
 
     df_avg = pd.DataFrame(
@@ -191,34 +205,30 @@ def make_rpm_rolling_avg(df):
             "robot_on": np.array(robot_on_avg),
             "large_mod_feed": np.array(large_mod_feed_avg),
             "n2_cons": np.array(n2_cons_avg),
-            "loadcell_diff": np.array(loadcell_diff_avg),
+            "loadcell_diff": np.array(load_cell_1_avg) - np.array(load_cell_3_avg),
+            "load_cell_1": np.array(load_cell_1_avg),
+            "load_cell_3": np.array(load_cell_3_avg),
         }
     )
 
     return df_avg
 
 
-def loadcell_dif_zeroer(df, start_time=None, end_time=None):
+def loadcell_dif_zeroer(df, start_time=None, end_time=None, loadcell_col="load_cell_1"):
     """
     Zero the load cell difference values in the DataFrame.
     If start_time and end_time are provided, only zero the values in that range.
+    The function subtracts the initial value in the range from all values in the range.
     """
+    df = df.copy()
     if start_time is not None and end_time is not None:
         mask = (df["timestamp"] >= start_time) & (df["timestamp"] <= end_time)
-        df.loc[mask, "loadcell_diff"] = 0
-    else:
-        df["loadcell_diff"] = 0
-    return df
+        if mask.any():
+            initial_value = abs(df.loc[mask, loadcell_col].iloc[0])
+            print(initial_value)
+            df.loc[mask, loadcell_col] = df.loc[mask, loadcell_col] - initial_value
+            df["loadcell_diff"] = df["load_cell_1"] - df["load_cell_3"]
 
-
-def add_mapping_column(df, ingest_id_times):
-    """
-    Add a mapping column to the DataFrame based on ingest_id_times.
-    """
-    df["ingest_id"] = None
-    for ingest_id, times in ingest_id_times.items():
-        for time in times:
-            df.loc[df["timestamp"] == time, "ingest_id"] = ingest_id
     return df
 
 
@@ -240,9 +250,16 @@ def run():
     df_labeled = df_labeled.reindex(columns=all_cols)
     df_avg_labeled = df_avg_labeled.reindex(columns=all_cols)
 
-    mask = (df_avg["rpm"] < 0.08) & (df_avg["kiln_weight"] < 700)
+    mask = ((df_avg["rpm"] < 0.08) & (df_avg["kiln_weight"] < 700)) | (df_avg["motor_amps"] < 0.1)
     df_avg = df_avg[~mask]
     df_avg = loadcell_dif_zeroer(df_avg)
+
+    df_avg = loadcell_dif_zeroer(
+        df_avg,
+        start_time=pd.Timestamp("2025-07-17 04:30", tz="UTC"),
+        end_time=pd.Timestamp("2025-07-22 07:30", tz="UTC"),
+    )
+    df_avg["loadcell_diff"] = abs(df_avg["loadcell_diff"])
 
     # Write df_avg to the Current Data folder
     output_dir = "Current Spike/Current Data"
@@ -250,6 +267,15 @@ def run():
     avg_out_path = os.path.join(output_dir, "updated_avg_motor_current.csv")
     df_avg.to_csv(avg_out_path, index=False)
     print(f"Wrote averaged data to {avg_out_path}")
+
+    # plt.plot(df_avg["timestamp"], df_avg["loadcell_diff"], label="Motor Amps (Avg)", color="blue")
+    # plt.xlabel("Timestamp")
+    # plt.ylabel("Motor Amps (Avg)")
+    # plt.title("Motor Amps (Avg) Over Time")
+    # plt.legend()
+    # plt.grid(True)
+    # plt.tight_layout()
+    # plt.show()
 
 
 if __name__ == "__main__":
