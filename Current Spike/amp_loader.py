@@ -24,7 +24,7 @@ if not os.path.exists(DATA_FOLDER):
 
 TAGS = {
     "motor_amps": "RC1/4420-Calciner/4420-KLN-001-MTR-001_Current/Input".lower(),
-    "small_mod_feed": "RC1/4420-Calciner/4420-CVR-001/Status/Speed_Feedback_Hz".lower(),
+    "small_mod_feed": "RC1/4420-Calciner/4420-CVR-001/Status/Speed_Feedback_Hz".lower(),  # 16 hz for robot with feed type we want
     "robot_on": "RC1/PLC8-Infeed_Robot/HMI/Feed_Robot_Mode/Value".lower(),
     "rpm": "RC1/4420-Calciner/4420-KLN-001_RPM/Input".lower(),
     "kiln_weight": "RC1/4420-Calciner/4420-WT-0007_Alarm/Input".lower(),
@@ -125,6 +125,7 @@ def make_rpm_rolling_avg(df):
     load_cell_1_avg = []
     load_cell_3_avg = []
     robot_on = []
+    small_mod_sp = []
     load_cell_1_rev = 0
     load_cell_3_rev = 0
 
@@ -177,6 +178,7 @@ def make_rpm_rolling_avg(df):
             load_cell_3_avg.append(load_cell_3_rev / num_pts_rev)
             match = df.loc[df["timestamp"] == t[i], "robot_on"]
             robot_on.append(match.values[0] if not match.empty else np.nan)
+            small_mod_sp.append(df.loc[df["timestamp"] == t[i], "small_mod_feed"].values[0])
 
             wt_rev = 0
             rpm_rev = 0
@@ -207,6 +209,7 @@ def make_rpm_rolling_avg(df):
             "loadcell_diff": np.array(load_cell_1_avg) - np.array(load_cell_3_avg),
             "load_cell_1": np.array(load_cell_1_avg),
             "load_cell_3": np.array(load_cell_3_avg),
+            "small_mod_sp": np.array(small_mod_sp),
         }
     )
 

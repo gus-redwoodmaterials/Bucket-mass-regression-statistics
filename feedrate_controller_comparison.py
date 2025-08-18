@@ -38,6 +38,8 @@ TAGS = {
     "feed_robot_mode": "rc1/plc8-infeed_robot/hmi/feed_robot_mode/value",
     "main_fan_speed": "rc1/4430-exhaust/4430-fan-004/status/speed_feedback_hz",
     "startup_on": "rc1/4420-calciner/acme/acmefeedrate/kiln_bed_build_mode_honor_request",
+    "tipper_one_on": "RC1/4410-FeedPrep/4410-VFR-001/Status/Speed_Feedback_Hz".lower(),
+    "tipper_two_on": "RC1/4410-FeedPrep/4410-VFR-002/Status/Speed_Feedback_Hz".lower(),
 }
 
 # Database configuration
@@ -510,6 +512,8 @@ def analysis(df, description="dataset"):
         if "avg_setpoint" in overshoot_results and overshoot_results["avg_setpoint"] is not None:
             print(f"   Average setpoint: {overshoot_results['avg_setpoint']:.2f} kg")
             print(f"   Relative overshoot: {overshoot_results['relative_overshoot_pct']:.2f}% of setpoint")
+        print(f"   Total time considered: {overshoot_results['total_time_hrs']:.2f} hours")
+        print(f"   Percent of time tippers were on: {overshoot_results['tipper_percentage']:.2f}%")
     else:
         print(f"\n   📊 KILN WEIGHT OVERSHOOT ANALYSIS:")
         print(f"   No overshoot analysis available.")
@@ -567,12 +571,16 @@ def overshoot_analysis(df):
         return None
     cutoff = df["kiln_weight_setpoint"].min() * 0.5
     overshoot = df[df["kiln_weight_avg"] > cutoff]
+    tipper_helper = df[(df["tipper_one_on"] > 0.1) & (df["tipper_two_on"] > 0.1)]
     overshoot = df["kiln_weight_avg"] - df["kiln_weight_setpoint"]
     positive_overshoot = overshoot[overshoot > 0]
     total_points = len(df)
     overshoot_points = len(positive_overshoot)
     overshoot_percentage = (overshoot_points / total_points) * 100 if total_points > 0 else 0
-
+    tipper_percentage = (
+        (len(tipper_helper) / total_points) * 100 if total_points > 0 else 0
+    )  # Percentage of time tipper is on
+    total_time_hrs = total_points * DATA_TIMESTEP_SECONDS / 3600  # Total time in hours
     if len(positive_overshoot) > 0:
         avg_overshoot = positive_overshoot.mean()
         max_overshoot = positive_overshoot.max()
@@ -591,6 +599,8 @@ def overshoot_analysis(df):
             "std_overshoot": std_overshoot,
             "avg_setpoint": avg_setpoint,
             "relative_overshoot_pct": relative_overshoot,
+            "tipper_percentage": tipper_percentage,
+            "total_time_hrs": total_time_hrs,
         }
     else:
         avg_setpoint = df["kiln_weight_setpoint"].mean() if "kiln_weight_setpoint" in df.columns else None
@@ -604,6 +614,8 @@ def overshoot_analysis(df):
             "std_overshoot": 0,
             "avg_setpoint": avg_setpoint,
             "relative_overshoot_pct": 0,
+            "tipper_percentage": 0,
+            "total_time_hrs": 0,
         }
 
 

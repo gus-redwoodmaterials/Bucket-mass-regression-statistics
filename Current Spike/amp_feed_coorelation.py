@@ -13,6 +13,8 @@ from statsmodels.stats.anova import anova_lm
 from sklearn.preprocessing import StandardScaler
 
 STANDARDIZE = False  # Set to True to use cumulative battery counts instead of rolling window
+ROBOT_MASS_FLOW = 3400  # kg/hr, used to convert battery counts to mass flow rate
+ROBOT_BANDS = [15.5, 17.5]  # hz
 
 import pandas as pd
 
@@ -137,6 +139,36 @@ def add_category_counts(
                     out.loc[row.name, f"cat_{category}"] = out.loc[row.name, f"cat_{category}"] + count
 
     return out
+
+
+def robot_mass_in(amps_df, time_start, time_end):
+    mask = (amps_df["timestamp_utc"] >= time_start) & (amps_df["timestamp_utc"] < time_end)
+    helper = amps_df[mask].copy()
+    start_feeding_robot = False
+    feeding_robot_starttime = None
+    time_robot_on = 0
+
+    for _, row in helper.iterrows():
+        robot_feed = (
+            row["robot_on"] == 1 and row["small_mod_sp"] > ROBOT_BANDS[0] and row["small_mod_sp"] < ROBOT_BANDS[1]
+        )
+        if robot_feed:
+            if not start_feeding_robot:
+                start_feeding_robot = True
+                feeding_robot_starttime = row["timestamp_utc"]
+        else:
+            if start_feeding_robot:
+                start_feeding_robot = False
+                time_robot_on += (row["timestamp_utc"] - feeding_robot_starttime).total_seconds() / 3600.0
+                feeding_robot_starttime = None
+
+    # If still feeding at the end, add the last segment
+    if start_feeding_robot and feeding_robot_starttime is not None:
+        last_time = helper["timestamp_utc"].iloc[-1]
+        time_robot_on += (last_time - feeding_robot_starttime).total_seconds() / 3600.0
+
+    total_mass_in = ROBOT_MASS_FLOW * time_robot_on
+    return total_mass_in
 
 
 def add_impact_table(model, df, prefix="impact_", q_lo=0.10, q_hi=0.90):
@@ -417,6 +449,12 @@ def create_analysis_dataframe(amps_df, buckets_df, battery_cols, start_time, sam
         for col in battery_cols:
             row[col] = window_counts.get(col, 0)
 
+        # Add robot mass in for the same rolling window
+        robot_mass = robot_mass_in(
+            amps_df.reset_index(), time_start=window_start if window_size != -1 else last_cleanout, time_end=timestamp
+        )
+        row["robot_mass_in_kg"] = robot_mass
+
         rows.append(row)
 
     # Create DataFrame with all data
@@ -504,9 +542,13 @@ def two_stage_regression(analysis_df, battery_cols, print_results=True):
 
     # 3. Second regression: residuals ~ battery types (standardized)
     scaler_batt = StandardScaler()
-    X_battery_raw = analysis_df[battery_cols]
+    X_battery_raw = analysis_df[battery_cols].copy()
+    # Add robot_mass_in_kg as a new column, with a string name
+    X_battery_raw["robot_mass_in_kg"] = analysis_df["robot_mass_in_kg"]
+    # Ensure all column names are strings
+    X_battery_raw.columns = X_battery_raw.columns.astype(str)
     X_battery_scaled = scaler_batt.fit_transform(X_battery_raw)
-    X_battery = pd.DataFrame(X_battery_scaled, columns=battery_cols, index=analysis_df.index)
+    X_battery = pd.DataFrame(X_battery_scaled, columns=X_battery_raw.columns, index=analysis_df.index)
     X_battery = sm.add_constant(X_battery)
     model_battery = sm.OLS(residuals, X_battery).fit()
     # Build tidy summary table for battery coefficients (skip intercept)
@@ -582,6 +624,7 @@ def run():
         .str.replace("/", "_")
         .str.lower()
     )
+    analysis_df["robot_mass_in_kg"] = analysis_df["robot_mass_in_kg"].astype(float)
     # mask = (analysis_df["rpm"] < 0.08) & (analysis_df["kiln_weight"] < 700)
     # analysis_df = analysis_df[~mask]  # Remove rows where rpm < 0.08 and kiln_weight < 700
 
