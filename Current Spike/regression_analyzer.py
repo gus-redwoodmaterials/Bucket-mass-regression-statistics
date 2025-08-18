@@ -13,7 +13,7 @@ def run():
     for fname in all_files:
         fpath = os.path.join(results_folder, fname)
         df = pd.read_csv(fpath)
-        if "material" in fname or "two_stage" not in fname or "lookback" not in fname:
+        if "material" in fname or "two_stage" not in fname:
             continue
         if "standardized" in fname:
             # Rename 'beta_std' to 'impact' if present
@@ -38,52 +38,46 @@ def run():
                 prefix = var
             if prefix in ignore:
                 continue
+            impact_val = float(row["impact"])
+            p_value = row.get("p_value", None)
+            if impact_val < 0:
+                ignore.append(prefix)
+                if prefix in impacts:
+                    del impacts[prefix]
+                continue
+            if p_value is not None and p_value > 0.05:
+                ignore.append(prefix)
+                if prefix in impacts:
+                    del impacts[prefix]
+                continue
             if prefix not in impacts:
                 impacts[prefix] = []
-                try:
-                    impact_val = float(row["impact"])
-                    if impact_val < 0:
-                        ignore.append(prefix)
-                        if prefix in impacts:
-                            del impacts[prefix]
-                        continue
-                    p_value = row.get("p_value", None)
-                    if p_value is not None and p_value > 0.05:
-                        continue
-                    impacts[prefix].append(impact_val)
-                except Exception:
-                    pass
-            else:
-                p_value = row.get("p_value", None)
-                impact = row.get("impact", None)
-                if impact < 0:
-                    ignore.append(prefix)
-                    if prefix in impacts:
-                        del impacts[prefix]
-                    continue
-                if p_value is not None and p_value > 0.05:
-                    impacts[prefix].append(float(impact))
+            impacts[prefix].append((impact_val, p_value))
 
     # --- Bar chart of standardized regression impacts for all variables ---
 
     # Collect all impacts and variable names from standardized files
+    battery_stats = {}
     for battery in list(impacts.keys()):
-        if impacts.get(battery) is None:
-            continue
-        if len(impacts[battery]) > 0:
-            impacts[battery] = np.mean(impacts[battery])
-        else:
+        vals = impacts.get(battery)
+        if vals is None or len(vals) == 0:
             del impacts[battery]
             continue
-        if impacts[battery] > 10:
+        impact_vals = [v[0] for v in vals]
+        p_vals = [v[1] for v in vals if v[1] is not None]
+        mean_impact = np.mean(impact_vals)
+        mean_p_value = np.mean(p_vals) if p_vals else None
+        if mean_impact > 10:
             del impacts[battery]
+            continue
+        battery_stats[battery] = {"mean_impact": mean_impact, "mean_p_value": mean_p_value}
 
-    filtered = list(impacts.items())
+    filtered = [(b, s["mean_impact"], s["mean_p_value"]) for b, s in battery_stats.items()]
     filtered.sort(key=lambda x: x[1], reverse=True)
-    top_vars, top_impacts = zip(*filtered[:7]) if filtered else ([], [])
+    top_vars, top_impacts, top_pvals = zip(*filtered[:7]) if filtered else ([], [], [])
 
     # Write top 7 batteries to CSV
-    top_battery_df = pd.DataFrame({"battery": top_vars, "mean_impact": top_impacts})
+    top_battery_df = pd.DataFrame({"battery": top_vars, "mean_impact": top_impacts, "mean_p_value": top_pvals})
     top_battery_csv = os.path.join(results_folder, "top7_batteries_by_impact.csv")
     top_battery_df.to_csv(top_battery_csv, index=False)
     print(f"Top 7 batteries written to {top_battery_csv}")

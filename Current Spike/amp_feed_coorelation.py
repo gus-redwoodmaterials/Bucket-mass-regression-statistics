@@ -565,7 +565,7 @@ def run():
     # Create safe column names with underscores
 
     # Use the create_analysis_dataframe function to generate analysis data
-    window_size = -1  # Use rolling window analysis
+    window_size = 60  # Use rolling window analysis
     STANDARDIZE = True
     analysis_df = create_analysis_dataframe(
         amps_df=amps_df,

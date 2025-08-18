@@ -35,6 +35,7 @@ TAGS = {
     "zone_3_temp": "RC1/4420-Calciner/4420-TE-7230-B_AI/Input_Scaled".lower(),
     "load_cell_1": "RC1/4420-Calciner/4420-WT-0007/Status/S_RealTimeWeight".lower(),
     "load_cell_3": "RC1/4420-Calciner/4420-WT-0009/Status/S_RealTimeWeight".lower(),
+    "robot_on": "RC1/PLC8-Infeed_Robot/HMI/Feed_Robot_Mode/Value".lower(),
 }
 
 
@@ -116,15 +117,14 @@ def make_rpm_rolling_avg(df):
     rpm_avg = []
     motor_amps_avg = []
     small_mod_feed_avg = []
-    robot_on_avg = []
     large_mod_feed_avg = []
     n2_cons_avg = []
     zone1_temp_avg = []
     zone2_temp_avg = []
     zone3_temp_avg = []
-    loadcell_diff_avg = []
     load_cell_1_avg = []
     load_cell_3_avg = []
+    robot_on = []
     load_cell_1_rev = 0
     load_cell_3_rev = 0
 
@@ -139,7 +139,6 @@ def make_rpm_rolling_avg(df):
     zone1_temp_rev = 0
     zone2_temp_rev = 0
     zone3_temp_rev = 0
-    loadcell_diff_rev = 0
     num_pts_rev = 0
 
     for i in range(1, len(rpm)):
@@ -169,7 +168,6 @@ def make_rpm_rolling_avg(df):
             wt_avg.append(wt_rev / num_pts_rev)
             motor_amps_avg.append(motor_amps_rev / num_pts_rev)
             small_mod_feed_avg.append(small_mod_feed_rev / num_pts_rev)
-            robot_on_avg.append(robot_on_rev / num_pts_rev)
             large_mod_feed_avg.append(large_mod_feed_rev / num_pts_rev)
             n2_cons_avg.append(n2_cons_rev / num_pts_rev)
             zone1_temp_avg.append(zone1_temp_rev / num_pts_rev)
@@ -177,12 +175,13 @@ def make_rpm_rolling_avg(df):
             zone3_temp_avg.append(zone3_temp_rev / num_pts_rev)
             load_cell_1_avg.append(load_cell_1_rev / num_pts_rev)
             load_cell_3_avg.append(load_cell_3_rev / num_pts_rev)
+            match = df.loc[df["timestamp"] == t[i], "robot_on"]
+            robot_on.append(match.values[0] if not match.empty else np.nan)
 
             wt_rev = 0
             rpm_rev = 0
             motor_amps_rev = 0
             small_mod_feed_rev = 0
-            robot_on_rev = 0
             large_mod_feed_rev = 0
             n2_cons_rev = 0
             zone1_temp_rev = 0
@@ -202,7 +201,7 @@ def make_rpm_rolling_avg(df):
             "zone_2_temp": np.array(zone2_temp_avg),
             "zone_3_temp": np.array(zone3_temp_avg),
             "small_mod_feed": np.array(small_mod_feed_avg),
-            "robot_on": np.array(robot_on_avg),
+            "robot_on": np.array(robot_on),
             "large_mod_feed": np.array(large_mod_feed_avg),
             "n2_cons": np.array(n2_cons_avg),
             "loadcell_diff": np.array(load_cell_1_avg) - np.array(load_cell_3_avg),
@@ -268,14 +267,14 @@ def run():
     df_avg.to_csv(avg_out_path, index=False)
     print(f"Wrote averaged data to {avg_out_path}")
 
-    # plt.plot(df_avg["timestamp"], df_avg["loadcell_diff"], label="Motor Amps (Avg)", color="blue")
-    # plt.xlabel("Timestamp")
-    # plt.ylabel("Motor Amps (Avg)")
-    # plt.title("Motor Amps (Avg) Over Time")
-    # plt.legend()
-    # plt.grid(True)
-    # plt.tight_layout()
-    # plt.show()
+    plt.plot(df_avg["timestamp"], df_avg["motor_amps"], label="Motor Amps (Avg)", color="blue")
+    plt.xlabel("Timestamp")
+    plt.ylabel("Motor Amps (Avg)")
+    plt.title("Motor Amps (Avg) Over Time")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
 
 if __name__ == "__main__":

@@ -30,13 +30,14 @@ TAGS = {
     "large_module_cycle_time": "rc1/4420-calciner/acmestatus/module_cycle_time_mpc_ts_now",
     "cycle_time_complete": "rc1/4420-calciner/module_loading/hmi/cycle_time_complete/value",
     "infeed_hz_actual": "rc1/4420-calciner/4420-cvr-001/status/speed_feedback_hz",
-    "kiln_weight_avg": "RC1/4420-Calciner/4420-WT-0007_Alarm/Input".lower(),
+    "kiln_weight_avg": "RC1/4420-Calciner/HMI/KilnWeightAvg/Value".lower(),
     "kiln_rpm": "rc1/4420-calciner/4420-kln-001_rpm/input",
     "kiln_weight_setpoint": "rc1/4420-calciner/hmi/4420-kln-001_weight_sp/value",
     "acme_alive": "rc1/4420-calciner/acme/acmefeedrate/acmealive",
     "acme_engineering": "rc1/4420-calciner/acme/acmefeedrate/acmeengineeringenable",
     "feed_robot_mode": "rc1/plc8-infeed_robot/hmi/feed_robot_mode/value",
     "main_fan_speed": "rc1/4430-exhaust/4430-fan-004/status/speed_feedback_hz",
+    "startup_on": "rc1/4420-calciner/acme/acmefeedrate/kiln_bed_build_mode_honor_request",
 }
 
 # Database configuration
@@ -59,24 +60,28 @@ def load_data(start_date_str, end_date_str, description="data"):
         DataFrame with the loaded data
     """
 
-    # Parse dates and localize to Pacific timezone
-    start = pacific_tz.localize(parse(start_date_str))
-    end = pacific_tz.localize(parse(end_date_str))
+    # Parse naive date strings as Pacific time, then convert to UTC for Athena
+    start_pacific = pacific_tz.localize(parse(start_date_str))
+    end_pacific = pacific_tz.localize(parse(end_date_str))
+    start_utc = start_pacific.astimezone(pytz.utc)
+    end_utc = end_pacific.astimezone(pytz.utc)
 
-    # Generate filename based on date range and description
-    start_str = start.strftime("%Y%m%d_%H%M")
-    end_str = end.strftime("%Y%m%d_%H%M")
+    # Generate filename based on Pacific time (for user clarity)
+    start_str = start_pacific.strftime("%Y%m%d_%H%M")
+    end_str = end_pacific.strftime("%Y%m%d_%H%M")
     csv_filename = f"feedrate_analysis_{description}_{start_str}_to_{end_str}.csv"
     csv_path = os.path.join(DATA_FOLDER, csv_filename)
 
-    print(f"\n📊 Loading {description} data: {start.strftime('%m/%d %H:%M')} to {end.strftime('%m/%d %H:%M')}")
+    print(
+        f"\n📊 Loading {description} data: {start_pacific.strftime('%m/%d %H:%M')} to {end_pacific.strftime('%m/%d %H:%M')} (Pacific)"
+    )
 
     # Check command line arguments for refresh flag
-    refresh_data = "--refresh" in sys.argv or "-r" in sys.argv
+    refresh_data = "-refresh" in sys.argv or "-r" in sys.argv
 
     # Try to load from cache first
     if not refresh_data and os.path.exists(csv_path):
-        print(f"   Loading from cache...")
+        print("   Loading from cache...")
         df = pd.read_csv(csv_path)
         # Convert timestamp back to datetime
         df["timestamp"] = pd.to_datetime(df["timestamp"])
@@ -84,41 +89,27 @@ def load_data(start_date_str, end_date_str, description="data"):
         print("   Fetching from Athena...")
         df = athena_download.get_pivoted_athena_data(
             TAGS,
-            start,
-            end,
+            start_utc,
+            end_utc,
             TABLE_PATH,
             DATA_TIMESTEP_SECONDS,
         )
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(pacific_tz)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         # Save to CSV for future use
         df.to_csv(csv_path, index=False)
         print("   Cached for future use")
 
-    # Filter out negative Hz values
-    if "infeed_hz_actual" in df.columns:
-        negative_hz_count = (df["infeed_hz_actual"] < 0).sum()
-        if negative_hz_count > 0:
-            print(f"   Cleaned {negative_hz_count} negative Hz values")
-            df.loc[df["infeed_hz_actual"] < 0, "infeed_hz_actual"] = np.nan
-
-    # Filter out negative kiln weight values (faulty data)
-    if "kiln_weight_avg" in df.columns:
-        negative_weight_count = (df["kiln_weight_avg"] < 0).sum()
-        if negative_weight_count > 0:
-            print(f"   Cleaned {negative_weight_count} negative kiln weight values")
-            df.loc[df["kiln_weight_avg"] < 0, "kiln_weight_avg"] = np.nan
-
     # Filter for operational periods: acme_alive=True AND acme_engineering=True AND feed_robot_mode=False
     initial_rows = len(df)
 
-    # Apply the operational filter
+    # Only look at times where acme is running without the robot
     df = df.loc[(df["acme_alive"] == 1) & (df["acme_engineering"] == 1) & (df["feed_robot_mode"] == 0)]
-    plt.plot(df["timestamp"], df["kiln_weight_avg"], label="Kiln Weight Avg")
-    plt.xlabel("Time")
-    plt.ylabel("Kiln Weight Avg (kg)")
-    plt.title("Kiln Weight Average Over Time")
-    plt.legend()
-    plt.show()
+    # plt.plot(df["timestamp"], df["kiln_weight_avg"], label="Kiln Weight Avg")
+    # plt.xlabel("Time")
+    # plt.ylabel("Kiln Weight Avg (kg)")
+    # plt.title("Kiln Weight Average Over Time")
+    # plt.legend()
+    # plt.show()
 
     filtered_rows = len(df)
 
@@ -138,7 +129,7 @@ DATA_TIMESTEP_SECONDS = 3  # 1 sample every 3 s
 SMOOTH_SIDE_POINTS = 5  # ±5 → 11-point window
 
 
-def analyze_kiln_weight_rate(df, rate_threshold_kg_per_hr=1500, rate_window_minutes=15):
+def analyze_kiln_weight_rate(df, rate_threshold_kg_per_hr=2000, rate_window_minutes=20):
     """
     Sliding‐window rate analysis with simple smoothing.
 
@@ -154,6 +145,12 @@ def analyze_kiln_weight_rate(df, rate_threshold_kg_per_hr=1500, rate_window_minu
         return {"high_rate_events": 0, "max_rate": 0, "max_rate_time": None, "rate_threshold": rate_threshold_kg_per_hr}
 
     # --- clean & sort ---
+    controller_hours = len(df) * DATA_TIMESTEP_SECONDS / 3600  # convert seconds to hours
+    cutoff = df["kiln_weight_setpoint"].min() * 0.5  # only consider high enough weights
+    df = df[df["kiln_weight_avg"] > cutoff].dropna(subset=["kiln_weight_avg", "timestamp"])
+    # Only exclude rows where startup_on == 1 (in startup); allow NaN and 0
+    if "startup_on" in df.columns:
+        df = df[(df["startup_on"].isna()) | (df["startup_on"] == 0)]
     clean = (
         df[["timestamp", "kiln_weight_avg"]]
         .dropna()
@@ -163,33 +160,33 @@ def analyze_kiln_weight_rate(df, rate_threshold_kg_per_hr=1500, rate_window_minu
         .reset_index(drop=True)
     )
 
-    if clean.empty:
+    rate_window_pts = int(rate_window_minutes * 60 / DATA_TIMESTEP_SECONDS)
+    if len(clean) <= rate_window_pts:
         return {"high_rate_events": 0, "max_rate": 0, "max_rate_time": None, "rate_threshold": rate_threshold_kg_per_hr}
 
-    # --- 1) ±5-point moving mean ---
-    smooth = (
-        clean["kiln_weight_avg"]
-        .rolling(window=2 * SMOOTH_SIDE_POINTS + 1, center=True, min_periods=1)
-        .mean()
-        .to_numpy()
-    )
+    rates = []
+    rate_time = []
+    i = 0
+    while i < len(clean) - rate_window_pts:
+        time_d_seconds = (clean["timestamp"].iloc[i + rate_window_pts] - clean["timestamp"].iloc[i]).total_seconds()
+        time_d_minutes = time_d_seconds / 60
+        time_d_hours = time_d_seconds / 3600
+        if time_d_minutes > rate_window_minutes:
+            i += 1
+            continue
+        delta_m = clean["kiln_weight_avg"].iloc[i + rate_window_pts] - clean["kiln_weight_avg"].iloc[i]
 
-    # --- 2) change in mass over 15 min (fixed lag) ---
-    rate_window_pts = int(rate_window_minutes * 60 / DATA_TIMESTEP_SECONDS)  # ≈300
-    if len(smooth) <= rate_window_pts:
-        return {"high_rate_events": 0, "max_rate": 0, "max_rate_time": None, "rate_threshold": rate_threshold_kg_per_hr}
+        rate = delta_m / (time_d_hours)  # kg/h
+        if rate >= rate_threshold_kg_per_hr:
+            rates.append(rate)
+            rate_time.append(clean["timestamp"].iloc[i + rate_window_pts])
+            i += rate_window_pts  # skip ahead to next window
+        else:
+            i += 1
+    rates = np.array(rates)
+    rate_time = np.array(rate_time)
 
-    delta_m = smooth[rate_window_pts:] - smooth[:-rate_window_pts]
-    rates = delta_m * 3600 / (rate_window_minutes * 60)  # kg / h   (== delta_m * 4)
-    rate_time = clean["timestamp"].iloc[rate_window_pts:].to_numpy()
-
-    # --- 3) detect excursions above threshold ---
-    above = rates > rate_threshold_kg_per_hr
-    edges = np.diff(np.concatenate(([0], above.view(np.int8), [0])))
-    starts = np.where(edges == 1)[0]  # rising edge indices
-    ends = np.where(edges == -1)[0] - 1  # falling edges
-
-    high_rate_events = len(starts)
+    high_rate_events = len(rates)
     if high_rate_events == 0:
         return {"high_rate_events": 0, "max_rate": 0, "max_rate_time": None, "rate_threshold": rate_threshold_kg_per_hr}
 
@@ -203,6 +200,7 @@ def analyze_kiln_weight_rate(df, rate_threshold_kg_per_hr=1500, rate_window_minu
         "max_rate": float(max_rate),
         "max_rate_time": peak_time,
         "rate_threshold": rate_threshold_kg_per_hr,
+        "rate_spikes_per_hour": high_rate_events / controller_hours if controller_hours > 0 else 0,
     }
 
 
@@ -216,7 +214,7 @@ def analyze_main_fan_spikes(
         df: DataFrame with main_fan_speed, kiln_weight_avg, and timestamp columns
         fan_spike_threshold_hz: Fan speed threshold for spike detection (default: 53.5 Hz)
         rolling_window_seconds: Rolling average window for fan spike detection (default: 40 seconds)
-        feeding_rate_threshold_kg_per_hr: Threshold for "sharp" feeding increases (default: 1000 kg/hr)
+        feeding_rate_threshold_kg_per_hr: Threshold for "sharp" feeding increases (default: 1500 kg/hr)
 
     Returns:
         Dictionary with fan spike analysis results
@@ -235,7 +233,7 @@ def analyze_main_fan_spikes(
 
     # Calculate 40-second rolling average of fan speed
     # For 3-second data, 40 seconds = ~13-14 data points
-    rolling_window_points = max(5, int(rolling_window_seconds / 3))
+    rolling_window_points = max(5, int(rolling_window_seconds / DATA_TIMESTEP_SECONDS))
 
     df_clean["fan_speed_rolling_avg"] = (
         df_clean["main_fan_speed"]
@@ -254,11 +252,14 @@ def analyze_main_fan_spikes(
     in_spike = False
     spike_start = None
 
-    for i, is_spike in enumerate(fan_spike_mask):
+    i = 0
+    while i < len(fan_spike_mask):
+        is_spike = fan_spike_mask.iloc[i] if hasattr(fan_spike_mask, "iloc") else fan_spike_mask[i]
         if is_spike and not in_spike:
             # Start of a new spike event
             in_spike = True
             spike_start = i
+            i += 1
         elif not is_spike and in_spike:
             # End of spike event
             in_spike = False
@@ -281,6 +282,20 @@ def analyze_main_fan_spikes(
                     "end_idx": spike_end,
                 }
             )
+
+            # Jump forward 20 minutes after the end of the spike
+            jump_minutes = 15
+            end_time = df_clean.iloc[spike_end]["timestamp"]
+            found_jump = False
+            for j in range(spike_end + 1, len(df_clean)):
+                if (df_clean.iloc[j]["timestamp"] - end_time).total_seconds() >= jump_minutes * 60:
+                    i = j
+                    found_jump = True
+                    break
+            if not found_jump:
+                break  # No more data at least 20 min after spike
+        else:
+            i += 1
 
     # Handle case where spike extends to end of data
     if in_spike:
@@ -476,67 +491,97 @@ def analysis(df, description="dataset"):
     """
     print(f"\n🔍 Analyzing {description}...")
 
-    # Check if required columns exist
+    overshoot_results = overshoot_analysis(df)
+    rate_analysis = analyze_kiln_weight_rate(df)
+    fan_analysis = analyze_main_fan_spikes(df)
+
+    # Print overshoot results
+    if overshoot_results:
+        print(f"\n   📊 KILN WEIGHT OVERSHOOT ANALYSIS:")
+        print(f"   Total data points: {overshoot_results['total_points']}")
+        print(
+            f"   Overshoot events: {overshoot_results['overshoot_events']} ({overshoot_results['overshoot_percentage']:.1f}% of time)"
+        )
+        print(f"   Average overshoot magnitude: {overshoot_results['avg_overshoot_magnitude']:.2f} kg")
+        print(
+            f"   Maximum overshoot: {overshoot_results['max_overshoot']:.2f} kg at {overshoot_results['max_overshoot_time']}"
+        )
+        print(f"   Overshoot std deviation: {overshoot_results['std_overshoot']:.2f} kg")
+        if "avg_setpoint" in overshoot_results and overshoot_results["avg_setpoint"] is not None:
+            print(f"   Average setpoint: {overshoot_results['avg_setpoint']:.2f} kg")
+            print(f"   Relative overshoot: {overshoot_results['relative_overshoot_pct']:.2f}% of setpoint")
+    else:
+        print(f"\n   📊 KILN WEIGHT OVERSHOOT ANALYSIS:")
+        print(f"   No overshoot analysis available.")
+
+    # Print rate analysis
+    if rate_analysis:
+        print(f"\n   📈 KILN WEIGHT RATE ANALYSIS:")
+        print(f"   Rate Spikes: {rate_analysis['high_rate_events']}")
+        print(f"   Maximum rate increase: {rate_analysis['max_rate']:.1f} kg/hr")
+        if rate_analysis["max_rate_time"]:
+            print(f"   Maximum rate occurred at: {rate_analysis['max_rate_time']}")
+        print(f"   Rate spikes per hour (controller running): {rate_analysis['rate_spikes_per_hour']:.3f}")
+
+    # Print fan analysis
+    if fan_analysis:
+        print(f"\n   🌪️  MAIN FAN SPIKE ANALYSIS:")
+        print(f"   Total fan spikes: {fan_analysis['fan_spikes']}")
+        print(f"   Average spikes per day: {fan_analysis['spikes_per_day']:.1f}")
+        if "fan_spike_per_hour_acme" in fan_analysis:
+            print(f"   Fan spikes per hour (controller running): {fan_analysis['fan_spike_per_hour_acme']:.3f}")
+
+    # Return key metrics for comparison
+    return {
+        "description": description,
+        "total_points": overshoot_results["total_points"] if overshoot_results else 0,
+        "overshoot_events": overshoot_results["overshoot_events"] if overshoot_results else 0,
+        "overshoot_percentage": overshoot_results["overshoot_percentage"] if overshoot_results else 0,
+        "avg_overshoot_magnitude": overshoot_results["avg_overshoot_magnitude"] if overshoot_results else 0,
+        "max_overshoot": overshoot_results["max_overshoot"] if overshoot_results else 0,
+        "max_overshoot_time": overshoot_results["max_overshoot_time"] if overshoot_results else None,
+        "std_overshoot": overshoot_results["std_overshoot"] if overshoot_results else 0,
+        "avg_setpoint": overshoot_results["avg_setpoint"]
+        if overshoot_results and "avg_setpoint" in overshoot_results
+        else None,
+        "relative_overshoot_pct": overshoot_results["relative_overshoot_pct"]
+        if overshoot_results and "relative_overshoot_pct" in overshoot_results
+        else None,
+        "high_rate_events": rate_analysis["high_rate_events"] if rate_analysis else 0,
+        "max_rate": rate_analysis["max_rate"] if rate_analysis else 0,
+        "fan_spikes": fan_analysis["fan_spikes"] if fan_analysis else 0,
+        "spikes_per_day": fan_analysis["spikes_per_day"] if fan_analysis else 0,
+        "fan_spike_per_hour_acme": fan_analysis["fan_spike_per_hour_acme"]
+        if fan_analysis and "fan_spike_per_hour_acme" in fan_analysis
+        else 0,
+    }
+
+
+def overshoot_analysis(df):
+    """
+    Perform overshoot analysis on the loaded DataFrame
+    Returns a dictionary of overshoot metrics
+    """
     if "kiln_weight_avg" not in df.columns or "kiln_weight_setpoint" not in df.columns:
         print("   ❌ Missing kiln weight columns - cannot perform overshoot analysis")
-        return
-
-    # Calculate overshoot: when actual weight exceeds setpoint
+        return None
+    cutoff = df["kiln_weight_setpoint"].min() * 0.5
+    overshoot = df[df["kiln_weight_avg"] > cutoff]
     overshoot = df["kiln_weight_avg"] - df["kiln_weight_setpoint"]
-
-    # Only consider positive overshoots (when weight exceeds setpoint)
     positive_overshoot = overshoot[overshoot > 0]
-
-    # Count overshoot events
     total_points = len(df)
     overshoot_points = len(positive_overshoot)
     overshoot_percentage = (overshoot_points / total_points) * 100 if total_points > 0 else 0
 
     if len(positive_overshoot) > 0:
-        # Calculate overshoot statistics
         avg_overshoot = positive_overshoot.mean()
         max_overshoot = positive_overshoot.max()
         std_overshoot = positive_overshoot.std()
-
-        # Find timestamp of maximum overshoot
         max_overshoot_idx = overshoot.idxmax()
         max_overshoot_time = df.loc[max_overshoot_idx, "timestamp"]
-
-        print(f"\n   📊 KILN WEIGHT OVERSHOOT ANALYSIS:")
-        print(f"   Total data points: {total_points}")
-        print(f"   Overshoot events: {overshoot_points} ({overshoot_percentage:.1f}% of time)")
-        print(f"   Average overshoot magnitude: {avg_overshoot:.2f} kg")
-        print(f"   Maximum overshoot: {max_overshoot:.2f} kg at {max_overshoot_time}")
-        print(f"   Overshoot std deviation: {std_overshoot:.2f} kg")
-
-        # Additional statistics
-        if "kiln_weight_setpoint" in df.columns:
-            avg_setpoint = df["kiln_weight_setpoint"].mean()
-            relative_overshoot = (avg_overshoot / avg_setpoint) * 100 if avg_setpoint > 0 else 0
-            print(f"   Average setpoint: {avg_setpoint:.2f} kg")
-            print(f"   Relative overshoot: {relative_overshoot:.2f}% of setpoint")
-
-        # Analyze rate of change in kiln weight (smoothed)
-        rate_analysis = analyze_kiln_weight_rate(df)
-        if rate_analysis:
-            print(f"\n   📈 KILN WEIGHT RATE ANALYSIS:")
-            print(f"   Events with >1 ton/hr increase: {rate_analysis['high_rate_events']}")
-            print(f"   Maximum rate increase: {rate_analysis['max_rate']:.1f} kg/hr")
-            if rate_analysis["max_rate_time"]:
-                print(f"   Maximum rate occurred at: {rate_analysis['max_rate_time']}")
-
-        # Analyze main fan spikes
-        fan_analysis = analyze_main_fan_spikes(df)
-        if fan_analysis:
-            print(f"\n   🌪️  MAIN FAN SPIKE ANALYSIS:")
-            print(f"   Total fan spikes: {fan_analysis['fan_spikes']}")
-            print(f"   Average spikes per day: {fan_analysis['spikes_per_day']:.1f}")
-            if "fan_spike_per_hour_acme" in fan_analysis:
-                print(f"   Fan spikes per hour (controller running): {fan_analysis['fan_spike_per_hour_acme']:.3f}")
-
-        # Return key metrics for comparison
+        avg_setpoint = df["kiln_weight_setpoint"].mean() if "kiln_weight_setpoint" in df.columns else None
+        relative_overshoot = (avg_overshoot / avg_setpoint) * 100 if avg_setpoint and avg_setpoint > 0 else 0
         return {
-            "description": description,
             "total_points": total_points,
             "overshoot_events": overshoot_points,
             "overshoot_percentage": overshoot_percentage,
@@ -544,30 +589,20 @@ def analysis(df, description="dataset"):
             "max_overshoot": max_overshoot,
             "max_overshoot_time": max_overshoot_time,
             "std_overshoot": std_overshoot,
-            "avg_setpoint": avg_setpoint if "kiln_weight_setpoint" in df.columns else None,
-            "relative_overshoot_pct": relative_overshoot if "kiln_weight_setpoint" in df.columns else None,
-            "high_rate_events": rate_analysis["high_rate_events"] if rate_analysis else 0,
-            "max_rate": rate_analysis["max_rate"] if rate_analysis else 0,
-            "fan_spikes": fan_analysis["fan_spikes"] if fan_analysis else 0,
-            "spikes_per_day": fan_analysis["spikes_per_day"] if fan_analysis else 0,
-            "fan_spike_per_hour_acme": fan_analysis["fan_spike_per_hour_acme"]
-            if fan_analysis and "fan_spike_per_hour_acme" in fan_analysis
-            else 0,
+            "avg_setpoint": avg_setpoint,
+            "relative_overshoot_pct": relative_overshoot,
         }
     else:
-        print(f"\n   📊 KILN WEIGHT OVERSHOOT ANALYSIS:")
-        print(f"   Total data points: {total_points}")
-        print(f"   ✅ No overshoot events detected - weight stayed below setpoint")
-
+        avg_setpoint = df["kiln_weight_setpoint"].mean() if "kiln_weight_setpoint" in df.columns else None
         return {
-            "description": description,
             "total_points": total_points,
             "overshoot_events": 0,
             "overshoot_percentage": 0,
             "avg_overshoot_magnitude": 0,
             "max_overshoot": 0,
+            "max_overshoot_time": None,
             "std_overshoot": 0,
-            "avg_setpoint": df["kiln_weight_setpoint"].mean() if "kiln_weight_setpoint" in df.columns else None,
+            "avg_setpoint": avg_setpoint,
             "relative_overshoot_pct": 0,
         }
 
@@ -583,81 +618,33 @@ def main():
     analyze_data = "--analyze" in sys.argv or "-a" in sys.argv
 
     # Example date ranges - modify these as needed
-    before_start = "2025-06-04T10:00:00"  # June 4th 10am
-    before_end = "2025-07-22T00:00:00"  # June 4th 11am
-    after_start = "2025-07-22T00:00:00"  # Modify this date
-    after_end = "2025-08-04T09:00:00"  # Modify this date
+    none_start = "2025-08-08T21:30:00"  # August 8th 9:30pm
+    none_end = "2025-08-13T06:24:00"  # August 13th 6:24am
+    bucket_start = "2025-08-02T15:00:00"  # Resumed filling August 13th 4:20pm
+    bucket_end = "2025-08-08T16:00:00"  # Modify this date to just be the most up to date
+    derivative_start = "2025-08-14T12:41:00"  # Resumed filling August 14th 8:00am
+    derivative_end = "2025-08-18T08:10:00"
 
     # Load June 4th data
     print(f"\n🔍 Loading data...")
-    df_before = load_data(before_start, before_end, "before_controller")
-    df_after = load_data(after_start, after_end, "after_controller")
+    df_none = load_data(none_start, none_end, "no_controller")
+    df_bucket = load_data(bucket_start, bucket_end, "bucket_controller")
+    df_derivative = load_data(derivative_start, derivative_end, "derivative_controller")
 
     # Perform analysis if requested
     if True:
         print(f"\n{'=' * 60}")
-        print("before_controller ANALYSIS")
+        print("no_controller ANALYSIS")
         print(f"{'=' * 60}")
-
-        # Analyze May 8-9 data
-        results_before = analysis(df_before, "before_controller")
-
-        # Uncomment these lines when you have after data:
-        results_after = analysis(df_after, "AFTER controller")
-
-        # Compare results
-        if results_before and results_after:
-            print(f"\n📊 COMPARISON SUMMARY:")
-            print(f"   BEFORE: {results_before['avg_overshoot_magnitude']:.2f} kg avg overshoot")
-            print(f"   AFTER:  {results_after['avg_overshoot_magnitude']:.2f} kg avg overshoot")
-            improvement = results_before["avg_overshoot_magnitude"] - results_after["avg_overshoot_magnitude"]
-            print(
-                f"   IMPROVEMENT: {improvement:.2f} kg ({improvement / results_before['avg_overshoot_magnitude'] * 100:.1f}% reduction)"
-            )
-
-            # Sharp increases in fan rate per day
-            if (
-                "high_rate_events" in results_before
-                and "high_rate_events" in results_after
-                and "total_points" in results_before
-                and "total_points" in results_after
-            ):
-                # Calculate days for before and after
-                before_days = results_before["total_points"] * 3 / 3600 / 24  # 3 sec per point
-                after_days = results_after["total_points"] * 3 / 3600 / 24
-                before_sharp_per_day = results_before["high_rate_events"] / before_days if before_days > 0 else 0
-                after_sharp_per_day = results_after["high_rate_events"] / after_days if after_days > 0 else 0
-                sharp_improvement = before_sharp_per_day - after_sharp_per_day
-                print(f"   BEFORE: {before_sharp_per_day:.2f} sharp increases per day")
-                print(f"   AFTER:  {after_sharp_per_day:.2f} sharp increases per day")
-                print(
-                    f"   IMPROVEMENT: {sharp_improvement:.2f} per day ({(sharp_improvement / before_sharp_per_day * 100) if before_sharp_per_day else 0:.1f}% reduction)"
-                )
-
-            # Fan spikes per day
-            if "spikes_per_day" in results_before and "spikes_per_day" in results_after:
-                before_spikes_per_day = results_before["spikes_per_day"]
-                after_spikes_per_day = results_after["spikes_per_day"]
-                spike_improvement = before_spikes_per_day - after_spikes_per_day
-                print(f"   BEFORE: {before_spikes_per_day:.2f} fan spikes per day")
-                print(f"   AFTER:  {after_spikes_per_day:.2f} fan spikes per day")
-                print(
-                    f"   IMPROVEMENT: {spike_improvement:.2f} per day ({(spike_improvement / before_spikes_per_day * 100) if before_spikes_per_day else 0:.1f}% reduction)"
-                )
-
-            # Fan spikes per hour (controller running)
-            if "fan_spike_per_hour_acme" in results_before and "fan_spike_per_hour_acme" in results_after:
-                before_spikes_per_hour = results_before["fan_spike_per_hour_acme"]
-                after_spikes_per_hour = results_after["fan_spike_per_hour_acme"]
-                spike_hour_improvement = before_spikes_per_hour - after_spikes_per_hour
-                print(f"   BEFORE: {before_spikes_per_hour:.3f} fan spikes per hour (controller running)")
-                print(f"   AFTER:  {after_spikes_per_hour:.3f} fan spikes per hour (controller running)")
-                print(
-                    f"   IMPROVEMENT: {spike_hour_improvement:.3f} per hour ({(spike_hour_improvement / before_spikes_per_hour * 100) if before_spikes_per_hour else 0:.1f}% reduction)"
-                )
-    else:
-        print(f"\n💡 Use --analyze or -a flag to perform overshoot analysis")
-        print(f"   Example: python feedrate_controller_comparison.py --analyze")
+        results_none = analysis(df_none, "no controller")
+        print(f"\n{'=' * 60}")
+        print("bucket_controller ANALYSIS")
+        print(f"{'=' * 60}")
+        results_bucket = analysis(df_bucket, "bucket controller")
+        print(f"\n{'=' * 60}")
+        print("derivative_controller ANALYSIS")
+        print(f"{'=' * 60}")
+        results_derivative = analysis(df_derivative, "derivative controller")
 
 
 if __name__ == "__main__":
