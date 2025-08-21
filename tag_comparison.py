@@ -121,7 +121,7 @@ def print_summary(df, tag1, tag2):
 
 def main():
     # Specify your file path and tags here
-    json_file = "/Users/gus.robinson/Desktop/Local Github Repos/rw-acme-to/docker_image/artifacts/2025_08_20_16_42_33/test_controllers.py/test_offline[mar_12_25]/new_writes.json"
+    json_file = "/Users/gus.robinson/Desktop/Local Github Repos/rw-acme-to/docker_image/artifacts/2025_08_20_18_53_42/test_controllers.py/test_offline[mar_12_25]/new_writes.json"
     tag1 = "Tag.TO_O2_OUTPUT"
     tag2 = "Tag.FRESH_AIR_VALVE_PERCENT"  # Change to your desired second tag
     output_csv = None  # Set to a filename if you want a custom output, else leave as None
