@@ -19,8 +19,8 @@ class PDController:
     def __init__(
         self,
         o2_normal_percent=12.0,
-        o2_min_percent=5.0,
-        o2_p_scaling=1.0,
+        o2_min_percent=2.0,
+        o2_p_scaling=0.5,
         o2_d_gain=-5.0,
         controller_run_interval=2.0,
         d_term_lookback_cycles=4.0,
@@ -35,6 +35,7 @@ class PDController:
 
         # Calculate P gain like in your actual controller
         self.o2_p_gain = self.o2_p_scaling / (self.o2_normal_percent - self.o2_min_percent) * 100
+        print(self.o2_p_gain)
 
         # History storage for derivative calculation
         self.o2_history = []
@@ -68,7 +69,7 @@ class PDController:
 
         if current_o2 <= self.o2_min_percent:
             # O2 below minimum - fully open fresh air valve
-            return 100
+            return self.o2_p_scaling * 100  # Open max amount ACME will let us
 
         # Calculate P term (proportional to error from normal O2)
         err = self.o2_normal_percent - current_o2  # Error from normal setpoint
@@ -100,14 +101,14 @@ class PDController:
         o2_control_term = p_term + d_term
 
         # Clamp to 0-100% valve opening (like in ACME controller)
-        o2_control_term = max(0.0, min(100.0, o2_control_term))
+        o2_control_term = max(0.0, min(self.o2_p_scaling * 100, o2_control_term))
 
         return o2_control_term
 
 
 def simulate_o2_signal(time_array):
     """
-    Generate the fake O2 signal that dips from 15% to 5% at 1%/s
+    Generate the fake O2 signal that dips from 15% to 3% at 0.5%/s
 
     Args:
         time_array: Array of time points
@@ -119,20 +120,21 @@ def simulate_o2_signal(time_array):
 
     # Find when the dip starts and ends
     dip_start_time = 20.0  # Start dip at t=20s
-    dip_duration = 10.0  # 10% change at 1%/s = 10 seconds
+    dip_amount = 10.0  # Dip from 15% to 5% (10% drop)
+    dip_duration = dip_amount / 0.5  # 0.5%/s rate
     dip_end_time = dip_start_time + dip_duration
-    recovery_duration = 15.0  # Take 15 seconds to recover back to 15%
+    recovery_duration = 20.0  # Take 20 seconds to recover back to 15%
     recovery_end_time = dip_end_time + recovery_duration
 
     for i, t in enumerate(time_array):
         if dip_start_time <= t <= dip_end_time:
-            # Linear dip from 15% to 5% at 1%/s
+            # Linear dip from 15% to 5% at 0.5%/s
             progress = (t - dip_start_time) / dip_duration
-            o2_values[i] = 15.0 - 10.0 * progress
+            o2_values[i] = 15.0 - dip_amount * progress  # 10% total drop (15% to 5%)
         elif dip_end_time < t <= recovery_end_time:
             # Recovery back to 15%
             progress = (t - dip_end_time) / recovery_duration
-            o2_values[i] = 5.0 + 10.0 * progress
+            o2_values[i] = 5.0 + dip_amount * progress  # 10% total recovery (5% to 15%)
         elif t > recovery_end_time:
             o2_values[i] = 15.0
 
@@ -143,15 +145,15 @@ def run_simulation():
     """Run the ACME thermal oxidizer O2 controller response simulation"""
 
     # Simulation parameters
-    total_time = 60.0  # Total simulation time (seconds)
+    total_time = 80.0  # Total simulation time (seconds) - increased for longer dip
     dt = 0.1  # Time step (seconds)
     time_array = np.arange(0, total_time + dt, dt)
 
     # Initialize controller (based on ACME thermal oxidizer O2 controller)
     controller = PDController(
         o2_normal_percent=12.0,  # Normal O2 setpoint
-        o2_min_percent=5.0,  # Min O2 setpoint
-        o2_p_scaling=1.0,  # P gain scaling
+        o2_min_percent=8.0,  # Min O2 setpoint - CHANGE THIS VALUE HERE
+        o2_p_scaling=0.35,  # P gain scaling - CHANGE THIS VALUE HERE
         o2_d_gain=-5.0,  # D gain (valve % per %O2/sec)
         controller_run_interval=2.0,  # Controller cycle time
         d_term_lookback_cycles=4.0,  # Lookback cycles for D term
@@ -195,6 +197,13 @@ def plot_results(results):
     """Plot the simulation results"""
 
     fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+
+    # Add shaded regions first (so they appear behind the lines)
+    # Normal O2 range (12-16%), with white space above and below
+    ax.axhspan(11.8, 15.7, xmin=0.03, xmax=0.97, alpha=0.2, color="green", label="Normal O2 Range")
+
+    # Base controls override region (below 5%), with white space above and below
+    ax.axhspan(0.3, 8, xmin=0.03, xmax=0.97, alpha=0.3, color="red", label="Base Controls Override")
 
     # Plot O2 signal and fresh air valve response on same plot
     ax.plot(results["time"], results["o2_signal"], "b--", linewidth=2, label="O2 Signal (%)")

@@ -16,6 +16,7 @@ import json
 import pandas as pd
 import sys
 from datetime import datetime
+import matplotlib.pyplot as plt
 
 
 def load_json_data(file_path):
@@ -32,53 +33,46 @@ def load_json_data(file_path):
         sys.exit(1)
 
 
-def compare_tags(data, tag1, tag2):
+def compare_tags(data, tags):
     """
-    Compare two tags and return a DataFrame with matching timestamps.
+    Compare multiple tags and return a DataFrame with matching timestamps.
 
     Args:
         data (dict): JSON data loaded from file
-        tag1 (str): First tag name
-        tag2 (str): Second tag name
+        tags (list): List of tag names to compare
 
     Returns:
-        pd.DataFrame: DataFrame with columns ['timestamp', 'tag1_name', 'tag1_value', 'tag2_name', 'tag2_value']
+        pd.DataFrame: DataFrame with timestamp and value columns for each tag
     """
-    # Check if both tags exist in the data
-    if tag1 not in data:
-        print(f"Error: Tag '{tag1}' not found in the data.")
-        available_tags = list(data.keys())[:10]  # Show first 10 tags
-        print(f"Available tags (first 10): {available_tags}")
+    # Check which tags exist in the data and get their data
+    tag_data = {}
+    for tag in tags:
+        if tag not in data:
+            print(f"Warning: Tag '{tag}' not found in data")
+        else:
+            tag_data[tag] = data[tag]
+
+    if not tag_data:
+        print("Error: No valid tags found in data")
         sys.exit(1)
 
-    if tag2 not in data:
-        print(f"Error: Tag '{tag2}' not found in the data.")
-        available_tags = list(data.keys())[:10]  # Show first 10 tags
-        print(f"Available tags (first 10): {available_tags}")
-        sys.exit(1)
+    # Get timestamps for each tag
+    tag_timestamps = {tag: set(tag_data[tag].keys()) for tag in tag_data}
 
-    tag1_data = data[tag1]
-    tag2_data = data[tag2]
-
-    # Find common timestamps
-    common_timestamps = set(tag1_data.keys()) & set(tag2_data.keys())
+    # Find common timestamps across all tags
+    common_timestamps = set.intersection(*tag_timestamps.values())
 
     if not common_timestamps:
-        print(f"Error: No common timestamps found between '{tag1}' and '{tag2}'.")
+        print("Error: No common timestamps found across all tags")
         sys.exit(1)
 
     # Create comparison data
     comparison_data = []
     for timestamp in sorted(common_timestamps):
-        comparison_data.append(
-            {
-                "timestamp": timestamp,
-                "tag1_name": tag1,
-                "tag1_value": tag1_data[timestamp],
-                "tag2_name": tag2,
-                "tag2_value": tag2_data[timestamp],
-            }
-        )
+        row_data = {"timestamp": timestamp}
+        for tag in tag_data:
+            row_data[f"{tag}_value"] = tag_data[tag][timestamp]
+        comparison_data.append(row_data)
 
     df = pd.DataFrame(comparison_data)
 
@@ -89,57 +83,41 @@ def compare_tags(data, tag1, tag2):
     return df
 
 
-def generate_output_filename(tag1, tag2):
-    """Generate a default output filename based on tag names and current time."""
-    # Clean tag names for filename (remove special characters)
-    clean_tag1 = "".join(c for c in tag1 if c.isalnum() or c in ("-", "_")).rstrip()
-    clean_tag2 = "".join(c for c in tag2 if c.isalnum() or c in ("-", "_")).rstrip()
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"tag_comparison_{clean_tag1}_vs_{clean_tag2}_{timestamp}.csv"
-
-
-def print_summary(df, tag1, tag2):
-    """Print a summary of the comparison."""
-    print("\n=== Tag Comparison Summary ===")
-    print(f"Tag 1: {tag1}")
-    print(f"Tag 2: {tag2}")
-    print(f"Total matching timestamps: {len(df)}")
-    print(f"Time range: {df['timestamp'].min()} to {df['timestamp'].max()}")
-
-    if len(df) > 0:
-        print("\nTag 1 statistics:")
-        print(f"  Mean: {df['tag1_value'].mean():.4f}")
-        print(f"  Min: {df['tag1_value'].min():.4f}")
-        print(f"  Max: {df['tag1_value'].max():.4f}")
-
-        print("\nTag 2 statistics:")
-        print(f"  Mean: {df['tag2_value'].mean():.4f}")
-        print(f"  Min: {df['tag2_value'].min():.4f}")
-        print(f"  Max: {df['tag2_value'].max():.4f}")
-
-
 def main():
     # Specify your file path and tags here
-    json_file = "/Users/gus.robinson/Desktop/Local Github Repos/rw-acme-to/docker_image/artifacts/2025_08_20_18_53_42/test_controllers.py/test_offline[mar_12_25]/new_writes.json"
-    tag1 = "Tag.TO_O2_OUTPUT"
-    tag2 = "Tag.FRESH_AIR_VALVE_PERCENT"  # Change to your desired second tag
-    output_csv = None  # Set to a filename if you want a custom output, else leave as None
+    json_file = "/Users/gus.robinson/Desktop/Local Github Repos/rw-acme-to/docker_image/artifacts/2025_09_05_20_50_34/test_controllers.py/test_offline[mar_12_25]/new_writes.json"
+
+    output_csv = "Tag_comparison.csv"  # Set to a filename if you want a custom output, else leave as None
+
+    tags = ["Tag.FEED_RATE_REQUESTED", "Tag.FEED_RATE_TARGET", "Tag.HZ_VAC_FAN"]
 
     print(f"Loading data from '{json_file}'...")
     data = load_json_data(json_file)
     print(f"Loaded data for {len(data)} tags.")
 
-    print(f"Comparing tags '{tag1}' and '{tag2}'...")
-    df = compare_tags(data, tag1, tag2)
+    print(f"Comparing tags '{tags[0]}' and '{tags[1]}'...")
+    df = compare_tags(data, tags)
 
-    if output_csv:
-        output_file = output_csv
-    else:
-        output_file = generate_output_filename(tag1, tag2)
+    df.to_csv(output_csv, index=False)
+    print(f"Results saved to '{output_csv}'")
 
-    df.to_csv(output_file, index=False)
-    print(f"Results saved to '{output_file}'")
+    fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
+    # First tag on top subplot
+    axes[0].plot(df["timestamp"], df[f"{tags[0]}_value"], color="blue")
+    axes[0].set_ylabel(f"{tags[0]} Value")
+    axes[0].set_title(f"{tags[0]} Over Time")
+    axes[0].grid(True)
+
+    # Second tag on bottom subplot
+    axes[1].plot(df["timestamp"], df[f"{tags[1]}_value"], color="orange")
+    axes[1].set_ylabel(f"{tags[1]} Value")
+    axes[1].set_title(f"{tags[1]} Over Time")
+    axes[1].grid(True)
+
+    axes[1].set_xlabel("Timestamp")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
 
     print("\nFirst 5 rows of comparison data:")
     print(df.head().to_string(index=False))
