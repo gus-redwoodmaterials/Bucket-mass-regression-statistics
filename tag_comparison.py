@@ -85,7 +85,7 @@ def compare_tags(data, tags):
 
 def main():
     # Specify your file path and tags here
-    json_file = "/Users/gus.robinson/Desktop/Local Github Repos/rw-acme-to/docker_image/artifacts/2025_09_05_20_50_34/test_controllers.py/test_offline[mar_12_25]/new_writes.json"
+    json_file = "/Users/gus.robinson/Desktop/Local Github Repos/rw-acme-to/docker_image/artifacts/2025_09_05_20_21_47/test_controllers.py/test_offline[mar_12_25]/new_writes.json"
 
     output_csv = "Tag_comparison.csv"  # Set to a filename if you want a custom output, else leave as None
 
@@ -104,14 +104,14 @@ def main():
     fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
     # First tag on top subplot
     axes[0].plot(df["timestamp"], df[f"{tags[0]}_value"], color="blue")
-    axes[0].set_ylabel(f"{tags[0]} Value")
-    axes[0].set_title(f"{tags[0]} Over Time")
+    axes[0].set_ylabel(f"Actual Feed Rate")
+    axes[0].set_title(f"Actual Feed Rate Over Time")
     axes[0].grid(True)
 
     # Second tag on bottom subplot
     axes[1].plot(df["timestamp"], df[f"{tags[1]}_value"], color="orange")
-    axes[1].set_ylabel(f"{tags[1]} Value")
-    axes[1].set_title(f"{tags[1]} Over Time")
+    axes[1].set_ylabel(f"Margin Limited Feed Rate")
+    axes[1].set_title(f"Margin Limited Feed Rate Over Time")
     axes[1].grid(True)
 
     axes[1].set_xlabel("Timestamp")
