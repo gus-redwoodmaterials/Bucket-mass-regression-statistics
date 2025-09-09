@@ -91,63 +91,77 @@ def load_kiln_data(start_date_str, end_date_str, description="kiln_data"):
     return df
 
 
-def create_analysis_dataframe(kiln_df, ms4_df):
+def create_analysis_dataframe(kiln_df, ms4_df, time_start=None, time_end=None, window_minutes=30):
     # Ensure datetime columns
-    kiln_df["timestamp"] = pd.to_datetime(kiln_df["timestamp"])
-    ms4_df["start_time_utc"] = pd.to_datetime(ms4_df["start_time_utc"])
-    ms4_df["end_time_utc"] = pd.to_datetime(ms4_df["end_time_utc"])
+    kiln_df["timestamp"] = pd.to_datetime(kiln_df["timestamp"], utc=True)
+    ms4_df["start_time_utc"] = pd.to_datetime(ms4_df["start_time_utc"], utc=True)
+    ms4_df["end_time_utc"] = pd.to_datetime(ms4_df["end_time_utc"], utc=True)
 
-    # Prepare lists to collect results
+    # Set time range
+    if time_start is None:
+        time_start = max(kiln_df["timestamp"].min(), ms4_df["start_time_utc"].min())
+    if time_end is None:
+        time_end = min(kiln_df["timestamp"].max(), ms4_df["end_time_utc"].max())
+
+    # Generate minute-by-minute timestamps
+    minute_range = pd.date_range(start=time_start, end=time_end, freq="1T", tz="UTC")
+
     results = []
-
-    # For each MS4 output, aggregate kiln data over its time window
-    for _, row in ms4_df.iterrows():
-        mask = (kiln_df["timestamp"] >= row["start_time_utc"]) & (kiln_df["timestamp"] <= row["end_time_utc"])
-        kiln_window = kiln_df.loc[mask]
-
-        # Compute averages (or other stats) for kiln variables in this window
+    for t in minute_range:
+        print(f"Processing time: {t}", end="\r")
+        # Rolling window for kiln data
+        t_start = t - pd.Timedelta(minutes=window_minutes)
+        kiln_window = kiln_df[(kiln_df["timestamp"] >= t_start) & (kiln_df["timestamp"] <= t)]
         kiln_weight_avg = kiln_window["kiln_weight_avg"].mean()
         kiln_rpm_avg = kiln_window["kiln_rpm"].mean()
         mass_inflow_feed_avg = kiln_window["mass_inflow_feed"].mean()
 
-        # Build combined row
+        # Find ms4 output that matches this minute (optional: nearest or within window)
+        ms4_row = ms4_df[(ms4_df["start_time_utc"] <= t) & (ms4_df["end_time_utc"] >= t)]
+        net_weight = ms4_row["net_weight"].mean() if not ms4_row.empty else np.nan
+
         results.append(
             {
+                "timestamp": t,
                 "kiln_weight_avg": kiln_weight_avg,
                 "kiln_rpm_avg": kiln_rpm_avg,
                 "mass_inflow_feed_avg": mass_inflow_feed_avg,
-                "net_weight": row["net_weight"],
-                "start_time_utc": row["start_time_utc"],
-                "end_time_utc": row["end_time_utc"],
+                "net_weight": net_weight,
             }
         )
 
-    # Create DataFrame
     analysis_df = pd.DataFrame(results)
-    analysis_df = analysis_df.dropna()
-
+    analysis_df = analysis_df.dropna(subset=["kiln_weight_avg", "kiln_rpm_avg", "mass_inflow_feed_avg"])
     return analysis_df
 
 
-def kiln_model_solids_out(df):
+def compute_rolling_averages(kiln_df, ms4_df, window_minutes=30):
     """
-    Simple kiln model to estimate weight based on RPM and mass flow
-
-    Args:
-        df: DataFrame with kiln data
-
-    Returns:
-        DataFrame with actual and modeled kiln weight
+    For each ms4 transaction_time, compute rolling averages of kiln variables over the preceding window_minutes.
+    Returns a DataFrame with rolling averages aligned to ms4 transaction times.
     """
+    # Ensure datetime columns
+    kiln_df["timestamp"] = pd.to_datetime(kiln_df["timestamp"], utc=True)
+    ms4_df["transaction_time_utc"] = pd.to_datetime(ms4_df["transaction_time_utc"], utc=True)
 
-    # Constants for the model
-    KILN_VOLUME = 10.0  # m^3, example volume of the kiln
-    DENSITY_SOLIDS = 1.5  # tonnes/m^3, example density of solids in the kiln
-
-    # Calculate the expected weight based on RPM and mass flow
-    df["modeled_kiln_weight"] = (df["kiln_rpm"] / 100.0) * KILN_VOLUME * DENSITY_SOLIDS + df["mass_inflow_feed"]
-
-    return df
+    results = []
+    for _, row in ms4_df.iterrows():
+        t_end = row["transaction_time_utc"]
+        t_start = t_end - pd.Timedelta(minutes=window_minutes)
+        mask = (kiln_df["timestamp"] >= t_start) & (kiln_df["timestamp"] <= t_end)
+        kiln_window = kiln_df.loc[mask]
+        results.append(
+            {
+                "transaction_time_utc": t_end,
+                "kiln_weight_avg": kiln_window["kiln_weight_avg"].mean(),
+                "kiln_rpm_avg": kiln_window["kiln_rpm"].mean(),
+                "mass_inflow_feed_avg": kiln_window["mass_inflow_feed"].mean(),
+                "net_weight": row.get("net_weight", None),
+            }
+        )
+    rolling_df = pd.DataFrame(results)
+    rolling_df = rolling_df.dropna()
+    return rolling_df
 
 
 def fit_k_constant(df):
@@ -162,7 +176,7 @@ def fit_k_constant(df):
     # Model function
     def model(X, k):
         kiln_weight, kiln_rpm = X
-        return k * kiln_weight * kiln_rpm
+        return k * kiln_weight ** (1 / 2) * kiln_rpm
 
     X = np.vstack([df["kiln_weight_avg"], df["kiln_rpm_avg"]])
     y = df["net_weight"].values
@@ -183,12 +197,12 @@ def plot_kiln_relationship(df, k_fit):
 
     plt.figure(figsize=(8, 6))
     plt.scatter(df["net_weight"], modeled, alpha=0.7)
-    plt.plot(
-        [df["net_weight"].min(), df["net_weight"].max()],
-        [df["net_weight"].min(), df["net_weight"].max()],
-        "r--",
-        label="Ideal Fit",
-    )
+    # plt.plot(
+    #     [df["net_weight"].min(), df["net_weight"].max()],
+    #     [df["net_weight"].min(), df["net_weight"].max()],
+    #     "r--",
+    #     label="Ideal Fit",
+    # )
     plt.xlabel("Actual Net Weight")
     plt.ylabel("Modeled Net Weight")
     plt.title("Actual vs Modeled Net Weight (k * kiln_weight_avg * kiln_rpm_avg)")
@@ -198,11 +212,47 @@ def plot_kiln_relationship(df, k_fit):
     plt.show()
 
 
-def run_analysis(kiln_df, ms4_df):
-    analysis_df = create_analysis_dataframe(kiln_df, ms4_df)
+def run_analysis(kiln_df, ms4_df, start_time=None, end_time=None):
+    analysis_df = create_analysis_dataframe(kiln_df, ms4_df, time_start=start_time, time_end=end_time)
     k_fit = fit_k_constant(analysis_df)
     plot_kiln_relationship(analysis_df, k_fit)
     return k_fit, analysis_df
+
+
+def plot_data_frames(kiln_data_df, ms4_out_df, start_time=None, end_time=None):
+    if start_time is not None and end_time is not None:
+        kiln_data_df = kiln_data_df[(kiln_data_df["timestamp"] >= start_time) & (kiln_data_df["timestamp"] <= end_time)]
+        ms4_out_df = ms4_out_df[(ms4_out_df["start_time_utc"] >= start_time) & (ms4_out_df["end_time_utc"] <= end_time)]
+
+    # Create a figure with two vertically stacked subplots
+    fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+    # Top subplot: kiln_weight_avg and kiln_rpm
+    ax1.plot(kiln_data_df["timestamp"], kiln_data_df["kiln_weight_avg"], label="Kiln Weight", color="orange")
+    ax1.set_ylabel("Kiln Weight", color="orange")
+    ax1.tick_params(axis="y", labelcolor="orange")
+    ax1.set_title("Kiln Weight and Kiln RPM Over Time")
+
+    ax2 = ax1.twinx()
+    ax2.plot(kiln_data_df["timestamp"], kiln_data_df["kiln_rpm"], label="Kiln RPM", color="blue", alpha=0.6)
+    ax2.set_ylabel("Kiln RPM", color="blue")
+    ax2.tick_params(axis="y", labelcolor="blue")
+
+    # Bottom subplot: MS4 net weight
+    ms4_out_df["start_time_utc"] = pd.to_datetime(ms4_out_df["start_time_utc"], utc=True)
+    ax3.scatter(ms4_out_df["start_time_utc"], ms4_out_df["net_weight"], label="MS4 Net Weight", color="orange", s=10)
+    ax3.set_ylabel("MS4 Net Weight", color="orange")
+    ax3.set_xlabel("Time")
+    ax3.set_title("MS4 Net Weight Over Time")
+    ax3.tick_params(axis="y", labelcolor="orange")
+
+    # Legends
+    ax1.legend(loc="upper left")
+    ax2.legend(loc="upper right")
+    ax3.legend(loc="upper left")
+
+    fig.tight_layout()
+    plt.show()
 
 
 def run():
@@ -217,7 +267,11 @@ def run():
     if "end_time_utc" in ms4_out_df.columns:
         ms4_out_df["end_time_utc"] = pd.to_datetime(ms4_out_df["end_time_utc"], utc=True)
 
-    run_analysis(kiln_data_df, ms4_out_df)
+    start_time = pd.Timestamp("2025-08-28 00:00:00", tz="UTC")
+    end_time = pd.Timestamp("2025-09-03 00:00:00", tz="UTC")
+    # run_analysis(kiln_data_df, ms4_out_df, start_time=start_time, end_time=end_time)
+
+    plot_data_frames(kiln_data_df, ms4_out_df, start_time=start_time, end_time=end_time)
 
 
 if __name__ == "__main__":
