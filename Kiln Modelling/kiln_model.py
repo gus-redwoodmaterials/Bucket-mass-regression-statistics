@@ -353,10 +353,17 @@ def run():
     if "end_time_utc" in ms4_out_df.columns:
         ms4_out_df["end_time_utc"] = pd.to_datetime(ms4_out_df["end_time_utc"], utc=True)
 
-    start_time = pd.Timestamp("2025-08-28 00:00:00", tz="UTC")
-    end_time = pd.Timestamp("2025-09-03 00:00:00", tz="UTC")
-    k_fit, analysis_df = run_analysis(kiln_data_df, ms4_out_df, start_time=start_time, end_time=end_time)
-    evaluate_model(analysis_df, ms4_out_df, k_fit, start_time, end_time)
+    analysis_df_start_time = pd.Timestamp("2025-08-28 00:00:00", tz="UTC")
+    analysis_df_end_time = pd.Timestamp("2025-09-23 00:00:00", tz="UTC")
+    k_fit, analysis_df = run_analysis(
+        kiln_data_df, ms4_out_df, start_time=analysis_df_start_time, end_time=analysis_df_end_time
+    )
+    evaluation_start_time = pd.Timestamp("2025-08-26 00:00:00", tz="UTC")
+    evaluation_end_time = pd.Timestamp("2025-08-28 00:00:00", tz="UTC")
+    helper_analysis_df = create_analysis_dataframe(
+        kiln_data_df, ms4_out_df, time_start=evaluation_start_time, time_end=evaluation_end_time
+    )
+    evaluate_model(helper_analysis_df, ms4_out_df, k_fit, evaluation_start_time, evaluation_end_time)
 
     # plot_data_frames(kiln_data_df, ms4_out_df, start_time=start_time, end_time=end_time)
 
