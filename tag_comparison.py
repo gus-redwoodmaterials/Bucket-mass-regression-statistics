@@ -85,11 +85,11 @@ def compare_tags(data, tags):
 
 def main():
     # Specify your file path and tags here
-    json_file = "/Users/gus.robinson/Desktop/Local Github Repos/rw-acme-to/docker_image/artifacts/2025_09_05_20_21_47/test_controllers.py/test_offline[mar_12_25]/new_writes.json"
+    json_file = "/Users/gus.robinson/Desktop/Local Github Repos/rw-acme-to/docker_image/artifacts/2025_09_09_19_00_03/test_controllers.py/test_offline[mar_12_25]/new_writes.json"
 
     output_csv = "Tag_comparison.csv"  # Set to a filename if you want a custom output, else leave as None
 
-    tags = ["Tag.FEED_RATE_REQUESTED", "Tag.FEED_RATE_TARGET", "Tag.HZ_VAC_FAN"]
+    tags = ["Tag.FEED_RATE_REQUESTED", "Tag.FEED_RATE_TARGET", "Tag.FEED_RAMP_RATE_POS"]
 
     print(f"Loading data from '{json_file}'...")
     data = load_json_data(json_file)
@@ -101,20 +101,26 @@ def main():
     df.to_csv(output_csv, index=False)
     print(f"Results saved to '{output_csv}'")
 
-    fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(15, 12), sharex=True)
     # First tag on top subplot
     axes[0].plot(df["timestamp"], df[f"{tags[0]}_value"], color="blue")
     axes[0].set_ylabel(f"Actual Feed Rate")
     axes[0].set_title(f"Actual Feed Rate Over Time")
     axes[0].grid(True)
 
-    # Second tag on bottom subplot
+    # Second tag on middle subplot
     axes[1].plot(df["timestamp"], df[f"{tags[1]}_value"], color="orange")
     axes[1].set_ylabel(f"Margin Limited Feed Rate")
     axes[1].set_title(f"Margin Limited Feed Rate Over Time")
     axes[1].grid(True)
 
-    axes[1].set_xlabel("Timestamp")
+    # Third tag on bottom subplot: Feed Ramp
+    axes[2].plot(df["timestamp"], df[f"{tags[2]}_value"], color="green")
+    axes[2].set_ylabel(f"Feed Ramp Rate")
+    axes[2].set_title(f"Feed Ramp Rate Over Time")
+    axes[2].grid(True)
+
+    axes[2].set_xlabel("Timestamp")
     plt.xticks(rotation=45)
     plt.tight_layout()
     plt.show()

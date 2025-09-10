@@ -104,29 +104,40 @@ def create_analysis_dataframe(kiln_df, ms4_df, time_start=None, time_end=None, w
         time_end = min(kiln_df["timestamp"].max(), ms4_df["end_time_utc"].max())
 
     # Generate minute-by-minute timestamps
-    minute_range = pd.date_range(start=time_start, end=time_end, freq="1T", tz="UTC")
+    window_starts = pd.date_range(start=time_start, end=time_end, freq=f"{window_minutes}T", tz="UTC")
 
     results = []
-    for t in minute_range:
-        print(f"Processing time: {t}", end="\r")
-        # Rolling window for kiln data
-        t_start = t - pd.Timedelta(minutes=window_minutes)
-        kiln_window = kiln_df[(kiln_df["timestamp"] >= t_start) & (kiln_df["timestamp"] <= t)]
+    for window_start in window_starts:
+        window_end = window_start + pd.Timedelta(minutes=window_minutes)
+
+        # Get kiln data for this window
+        kiln_window = kiln_df[(kiln_df["timestamp"] >= window_start) & (kiln_df["timestamp"] < window_end)]
+        if len(kiln_window) == 0:
+            continue
+
+        # Average kiln parameters over the window
         kiln_weight_avg = kiln_window["kiln_weight_avg"].mean()
         kiln_rpm_avg = kiln_window["kiln_rpm"].mean()
         mass_inflow_feed_avg = kiln_window["mass_inflow_feed"].mean()
 
-        # Find ms4 output that matches this minute (optional: nearest or within window)
-        ms4_row = ms4_df[(ms4_df["start_time_utc"] <= t) & (ms4_df["end_time_utc"] >= t)]
-        net_weight = ms4_row["net_weight"].mean() if not ms4_row.empty else np.nan
+        # Get MS4 events COMPLETED within this window (use end_time_utc)
+        # This captures all material that came out during this window
+        ms4_window = ms4_df[(ms4_df["end_time_utc"] >= window_start) & (ms4_df["end_time_utc"] < window_end)]
+        total_mass_out = ms4_window["net_weight"].sum() if not ms4_window.empty else 0
+
+        # Calculate mass flow rate in kg/hr
+        hours = window_minutes / 60.0
+        mass_flow_rate = total_mass_out / hours if hours > 0 else 0
 
         results.append(
             {
-                "timestamp": t,
+                "window_start": window_start,
+                "window_end": window_end,
                 "kiln_weight_avg": kiln_weight_avg,
                 "kiln_rpm_avg": kiln_rpm_avg,
                 "mass_inflow_feed_avg": mass_inflow_feed_avg,
-                "net_weight": net_weight,
+                "total_mass_out": total_mass_out,
+                "mass_flow_rate_kg_hr": mass_flow_rate,
             }
         )
 
@@ -135,57 +146,130 @@ def create_analysis_dataframe(kiln_df, ms4_df, time_start=None, time_end=None, w
     return analysis_df
 
 
-def compute_rolling_averages(kiln_df, ms4_df, window_minutes=30):
-    """
-    For each ms4 transaction_time, compute rolling averages of kiln variables over the preceding window_minutes.
-    Returns a DataFrame with rolling averages aligned to ms4 transaction times.
-    """
-    # Ensure datetime columns
-    kiln_df["timestamp"] = pd.to_datetime(kiln_df["timestamp"], utc=True)
-    ms4_df["transaction_time_utc"] = pd.to_datetime(ms4_df["transaction_time_utc"], utc=True)
-
-    results = []
-    for _, row in ms4_df.iterrows():
-        t_end = row["transaction_time_utc"]
-        t_start = t_end - pd.Timedelta(minutes=window_minutes)
-        mask = (kiln_df["timestamp"] >= t_start) & (kiln_df["timestamp"] <= t_end)
-        kiln_window = kiln_df.loc[mask]
-        results.append(
-            {
-                "transaction_time_utc": t_end,
-                "kiln_weight_avg": kiln_window["kiln_weight_avg"].mean(),
-                "kiln_rpm_avg": kiln_window["kiln_rpm"].mean(),
-                "mass_inflow_feed_avg": kiln_window["mass_inflow_feed"].mean(),
-                "net_weight": row.get("net_weight", None),
-            }
-        )
-    rolling_df = pd.DataFrame(results)
-    rolling_df = rolling_df.dropna()
-    return rolling_df
-
-
 def fit_k_constant(df):
     """
     Fit the constant k for the model: net_weight = k * kiln_weight_avg * kiln_rpm_avg
     Returns the fitted k value.
     """
     # Drop rows with missing or zero values to avoid log(0)
-    df = df.dropna(subset=["net_weight", "kiln_weight_avg", "kiln_rpm_avg"])
-    df = df[(df["net_weight"] > 0) & (df["kiln_weight_avg"] > 0) & (df["kiln_rpm_avg"] > 0)]
+    df = df.dropna(subset=["kiln_weight_avg", "kiln_rpm_avg"])
+    df = df[(df["kiln_weight_avg"] > 0) & (df["kiln_rpm_avg"] > 0)]
 
     # Model function
     def model(X, k):
         kiln_weight, kiln_rpm = X
         return k * kiln_weight ** (1 / 2) * kiln_rpm
 
+    # regressing against our rate of weight out (kg/s) instead of total net weight
     X = np.vstack([df["kiln_weight_avg"], df["kiln_rpm_avg"]])
-    y = df["net_weight"].values
+    y = df["mass_flow_rate_kg_hr"].values
 
     # Fit k using curve_fit
     popt, _ = curve_fit(model, X, y)
     k_fit = popt[0]
     print(f"Fitted k: {k_fit:.4f}")
     return k_fit
+
+
+def evaluate_model(analysis_df, ms4_df, k_fit, start_time, end_time, model_exponent=0.5):
+    """
+    Evaluate the model performance by comparing actual total mass out vs predicted total mass out.
+
+    Args:
+        analysis_df: DataFrame with window_start, window_end, kiln variables, mass_flow_rate_kg_hr
+        ms4_df: DataFrame with start_time_utc, end_time_utc, net_weight
+        k_fit: Fitted k constant for the model
+        start_time, end_time: Time range for evaluation
+        model_exponent: Exponent for kiln_weight_avg in the model (default 0.5 for square root)
+    """
+    # Filter DataFrames to the specified time range
+    analysis_window = analysis_df[
+        (analysis_df["window_start"] >= start_time) & (analysis_df["window_end"] <= end_time)
+    ].copy()
+    ms4_window = ms4_df[(ms4_df["end_time_utc"] >= start_time) & (ms4_df["end_time_utc"] <= end_time)]
+
+    # Actual total mass out from MS4 data
+    actual_total_mass = ms4_window["net_weight"].sum()
+
+    # Predict mass flow rate for each window using our model
+    for i, row in analysis_window.iterrows():
+        # Calculate predicted mass flow rate using our model
+        predicted_flow_rate = k_fit * (row["kiln_weight_avg"] ** model_exponent) * row["kiln_rpm_avg"]
+        analysis_window.at[i, "predicted_flow_rate_kg_hr"] = predicted_flow_rate
+
+        # Calculate window duration in hours
+        window_duration_hours = (row["window_end"] - row["window_start"]).total_seconds() / 3600
+
+        # Calculate predicted mass out for this window (integral of flow rate * time)
+        predicted_mass_out = predicted_flow_rate * window_duration_hours
+        analysis_window.at[i, "predicted_mass_out"] = predicted_mass_out
+
+    # Total predicted mass out (sum of all windows)
+    predicted_total_mass = analysis_window["predicted_mass_out"].sum()
+
+    # Calculate error metrics
+    absolute_error = abs(actual_total_mass - predicted_total_mass)
+    relative_error = absolute_error / actual_total_mass * 100 if actual_total_mass > 0 else float("inf")
+
+    # Calculate RMSE for flow rate predictions vs actual flow rates
+    analysis_window = analysis_window.dropna(subset=["mass_flow_rate_kg_hr"])
+    if len(analysis_window) > 0:
+        residuals = analysis_window["mass_flow_rate_kg_hr"] - analysis_window["predicted_flow_rate_kg_hr"]
+        rmse = np.sqrt(np.mean(residuals**2))
+
+        # Calculate R-squared
+        ss_total = np.sum(
+            (analysis_window["mass_flow_rate_kg_hr"] - analysis_window["mass_flow_rate_kg_hr"].mean()) ** 2
+        )
+        ss_residual = np.sum(residuals**2)
+        r_squared = 1 - (ss_residual / ss_total) if ss_total > 0 else 0
+    else:
+        rmse = None
+        r_squared = None
+
+    # Print results
+    print(f"\nModel Evaluation from {start_time} to {end_time}:")
+    print(f"  Actual total mass out: {actual_total_mass:.2f} kg")
+    print(f"  Predicted total mass out: {predicted_total_mass:.2f} kg")
+    print(f"  Absolute error: {absolute_error:.2f} kg")
+    print(f"  Relative error: {relative_error:.2f}%")
+    if rmse is not None:
+        print(f"  RMSE (flow rate): {rmse:.2f} kg/hr")
+        print(f"  R² (flow rate): {r_squared:.4f}")
+
+    # Create a plot comparing actual vs predicted flow rates
+    if len(analysis_window) > 0:
+        plt.figure(figsize=(10, 6))
+        plt.plot(
+            analysis_window["window_start"],
+            analysis_window["mass_flow_rate_kg_hr"],
+            label="Actual Flow Rate",
+            marker="o",
+        )
+        plt.plot(
+            analysis_window["window_start"],
+            analysis_window["predicted_flow_rate_kg_hr"],
+            label="Predicted Flow Rate",
+            marker="x",
+        )
+        plt.xlabel("Time")
+        plt.ylabel("Mass Flow Rate (kg/hr)")
+        plt.title("Actual vs Predicted Mass Flow Rate")
+        plt.legend()
+        plt.grid(True)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+
+    return {
+        "actual_total_mass": actual_total_mass,
+        "predicted_total_mass": predicted_total_mass,
+        "absolute_error": absolute_error,
+        "relative_error": relative_error,
+        "rmse": rmse,
+        "r_squared": r_squared,
+        "analysis_window": analysis_window,  # Return the window for further analysis
+    }
 
 
 def plot_kiln_relationship(df, k_fit):
@@ -214,8 +298,10 @@ def plot_kiln_relationship(df, k_fit):
 
 def run_analysis(kiln_df, ms4_df, start_time=None, end_time=None):
     analysis_df = create_analysis_dataframe(kiln_df, ms4_df, time_start=start_time, time_end=end_time)
+    print("\nAnalysis DataFrame:")
+    print(analysis_df.head())
     k_fit = fit_k_constant(analysis_df)
-    plot_kiln_relationship(analysis_df, k_fit)
+    # plot_kiln_relationship(analysis_df, k_fit)
     return k_fit, analysis_df
 
 
@@ -269,9 +355,10 @@ def run():
 
     start_time = pd.Timestamp("2025-08-28 00:00:00", tz="UTC")
     end_time = pd.Timestamp("2025-09-03 00:00:00", tz="UTC")
-    # run_analysis(kiln_data_df, ms4_out_df, start_time=start_time, end_time=end_time)
+    k_fit, analysis_df = run_analysis(kiln_data_df, ms4_out_df, start_time=start_time, end_time=end_time)
+    evaluate_model(analysis_df, ms4_out_df, k_fit, start_time, end_time)
 
-    plot_data_frames(kiln_data_df, ms4_out_df, start_time=start_time, end_time=end_time)
+    # plot_data_frames(kiln_data_df, ms4_out_df, start_time=start_time, end_time=end_time)
 
 
 if __name__ == "__main__":
