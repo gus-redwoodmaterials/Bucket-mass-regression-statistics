@@ -14,7 +14,7 @@ from scipy.optimize import curve_fit
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 # Configuration
-DATA_FOLDER = "/Users/gus.robinson/Desktop/Local Python Coding/Kiln Modelling/Data"
+DATA_FOLDER = "Kiln Modelling/Data"
 
 # Create data folder if it doesn't exist
 if not os.path.exists(DATA_FOLDER):
@@ -142,6 +142,7 @@ def create_analysis_dataframe(kiln_df, ms4_df, time_start=None, time_end=None, w
         )
 
     analysis_df = pd.DataFrame(results)
+    analysis_df.dropna(inplace=True)
     analysis_df = analysis_df.dropna(subset=["kiln_weight_avg", "kiln_rpm_avg", "mass_inflow_feed_avg"])
     return analysis_df
 
@@ -342,8 +343,8 @@ def plot_data_frames(kiln_data_df, ms4_out_df, start_time=None, end_time=None):
 
 
 def run():
-    kiln_data_df = load_kiln_data("'2025-06-01 00:00:00'", "'2025-09-08 00:00:00'", description="kiln_data")
-    ms4_out_df = pd.read_csv("/Users/gus.robinson/Desktop/Local Python Coding/Kiln Modelling/Data/ms4_out_data.csv")
+    kiln_data_df = load_kiln_data("'2025-08-25 00:00:00'", "'2025-09-10 00:00:00'", description="kiln_data")
+    ms4_out_df = pd.read_csv(f"{DATA_FOLDER}/ms4_out_data.csv")
     ms4_out_df = ms4_out_df[ms4_out_df["net_weight"] > 1].copy()  # Filter out very small weights
 
     # After loading kiln_df and ms4_df from CSV, ensure all timestamps are UTC and timezone-aware
@@ -353,19 +354,19 @@ def run():
     if "end_time_utc" in ms4_out_df.columns:
         ms4_out_df["end_time_utc"] = pd.to_datetime(ms4_out_df["end_time_utc"], utc=True)
 
-    analysis_df_start_time = pd.Timestamp("2025-08-28 00:00:00", tz="UTC")
-    analysis_df_end_time = pd.Timestamp("2025-09-23 00:00:00", tz="UTC")
+    analysis_df_start_time = pd.Timestamp("2025-08-30 00:00:00", tz="UTC")
+    analysis_df_end_time = pd.Timestamp("2025-09-10 00:00:00", tz="UTC")
     k_fit, analysis_df = run_analysis(
         kiln_data_df, ms4_out_df, start_time=analysis_df_start_time, end_time=analysis_df_end_time
     )
-    evaluation_start_time = pd.Timestamp("2025-08-26 00:00:00", tz="UTC")
-    evaluation_end_time = pd.Timestamp("2025-08-28 00:00:00", tz="UTC")
+    evaluation_start_time = pd.Timestamp("2025-08-25 00:00:00", tz="UTC")
+    evaluation_end_time = pd.Timestamp("2025-08-30 00:00:00", tz="UTC")
     helper_analysis_df = create_analysis_dataframe(
         kiln_data_df, ms4_out_df, time_start=evaluation_start_time, time_end=evaluation_end_time
     )
     evaluate_model(helper_analysis_df, ms4_out_df, k_fit, evaluation_start_time, evaluation_end_time)
 
-    # plot_data_frames(kiln_data_df, ms4_out_df, start_time=start_time, end_time=end_time)
+    # plot_data_frames(kiln_data_df, ms4_out_df, start_time=evaluation_start_time, end_time=evaluation_end_time)
 
 
 if __name__ == "__main__":
