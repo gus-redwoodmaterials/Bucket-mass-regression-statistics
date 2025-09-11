@@ -13,6 +13,8 @@ from scipy.optimize import curve_fit
 # Suppress all FutureWarning messages
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
+MODEL_EXPONENT = 1 / 2  # Change this to 0.5 for square root model, 1 for linear model
+
 # Configuration
 DATA_FOLDER = "/Users/gus.robinson/Desktop/Local Python Coding/Kiln Modelling/Data"
 
@@ -158,7 +160,7 @@ def fit_k_constant(df):
     # Model function
     def model(X, k):
         kiln_weight, kiln_rpm = X
-        return k * kiln_weight ** (1 / 2) * kiln_rpm
+        return k * kiln_weight ** (MODEL_EXPONENT) * kiln_rpm
 
     # regressing against our rate of weight out (kg/s) instead of total net weight
     X = np.vstack([df["kiln_weight_avg"], df["kiln_rpm_avg"]])
@@ -171,7 +173,31 @@ def fit_k_constant(df):
     return k_fit
 
 
-def evaluate_model(analysis_df, ms4_df, k_fit, start_time, end_time, model_exponent=0.5):
+def fit_k_and_v_constants(df):
+    """
+    Fit constants k and v for the model: mass_flow_rate_kg_hr = k * kiln_weight_avg ** v * kiln_rpm_avg
+    Returns the fitted k and v values.
+    """
+    # Drop rows with missing or zero values to avoid log(0)
+    df = df.dropna(subset=["kiln_weight_avg", "kiln_rpm_avg"])
+    df = df[(df["kiln_weight_avg"] > 0) & (df["kiln_rpm_avg"] > 0)]
+
+    # Model function
+    def model(X, k, v):
+        kiln_weight, kiln_rpm = X
+        return k * kiln_weight**v * kiln_rpm
+
+    X = np.vstack([df["kiln_weight_avg"], df["kiln_rpm_avg"]])
+    y = df["mass_flow_rate_kg_hr"].values
+
+    # Only bound v (0.25 to 4), leave k completely unbounded
+    popt, _ = curve_fit(model, X, y, bounds=([-np.inf, 0.25], [np.inf, 4]))
+    k_fit, v_fit = popt
+    print(f"Fitted k: {k_fit:.4f}, Fitted v: {v_fit:.4f}")
+    return k_fit, v_fit
+
+
+def evaluate_model(analysis_df, ms4_df, k_fit, v_fit, start_time, end_time):
     """
     Evaluate the model performance by comparing actual total mass out vs predicted total mass out.
 
@@ -194,7 +220,7 @@ def evaluate_model(analysis_df, ms4_df, k_fit, start_time, end_time, model_expon
     # Predict mass flow rate for each window using our model
     for i, row in analysis_window.iterrows():
         # Calculate predicted mass flow rate using our model
-        predicted_flow_rate = k_fit * (row["kiln_weight_avg"] ** model_exponent) * row["kiln_rpm_avg"]
+        predicted_flow_rate = k_fit * (row["kiln_weight_avg"] ** v_fit) * row["kiln_rpm_avg"]
         analysis_window.at[i, "predicted_flow_rate_kg_hr"] = predicted_flow_rate
 
         # Calculate window duration in hours
@@ -272,35 +298,12 @@ def evaluate_model(analysis_df, ms4_df, k_fit, start_time, end_time, model_expon
     }
 
 
-def plot_kiln_relationship(df, k_fit):
-    """
-    Plot actual net_weight vs modeled net_weight using fitted k.
-    """
-    df = df.dropna(subset=["net_weight", "kiln_weight_avg", "kiln_rpm_avg"])
-    modeled = k_fit * df["kiln_weight_avg"] * df["kiln_rpm_avg"]
-
-    plt.figure(figsize=(8, 6))
-    plt.scatter(df["net_weight"], modeled, alpha=0.7)
-    # plt.plot(
-    #     [df["net_weight"].min(), df["net_weight"].max()],
-    #     [df["net_weight"].min(), df["net_weight"].max()],
-    #     "r--",
-    #     label="Ideal Fit",
-    # )
-    plt.xlabel("Actual Net Weight")
-    plt.ylabel("Modeled Net Weight")
-    plt.title("Actual vs Modeled Net Weight (k * kiln_weight_avg * kiln_rpm_avg)")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-
 def run_analysis(kiln_df, ms4_df, start_time=None, end_time=None):
     analysis_df = create_analysis_dataframe(kiln_df, ms4_df, time_start=start_time, time_end=end_time)
     print("\nAnalysis DataFrame:")
     print(analysis_df.head())
     k_fit = fit_k_constant(analysis_df)
+    # k_fit, v_fit = fit_k_and_v_constants(analysis_df)
     # plot_kiln_relationship(analysis_df, k_fit)
     return k_fit, analysis_df
 
@@ -354,7 +357,7 @@ def run():
         ms4_out_df["end_time_utc"] = pd.to_datetime(ms4_out_df["end_time_utc"], utc=True)
 
     analysis_df_start_time = pd.Timestamp("2025-08-28 00:00:00", tz="UTC")
-    analysis_df_end_time = pd.Timestamp("2025-09-23 00:00:00", tz="UTC")
+    analysis_df_end_time = pd.Timestamp("2025-09-03 00:00:00", tz="UTC")
     k_fit, analysis_df = run_analysis(
         kiln_data_df, ms4_out_df, start_time=analysis_df_start_time, end_time=analysis_df_end_time
     )
@@ -363,7 +366,7 @@ def run():
     helper_analysis_df = create_analysis_dataframe(
         kiln_data_df, ms4_out_df, time_start=evaluation_start_time, time_end=evaluation_end_time
     )
-    evaluate_model(helper_analysis_df, ms4_out_df, k_fit, evaluation_start_time, evaluation_end_time)
+    evaluate_model(helper_analysis_df, ms4_out_df, k_fit, MODEL_EXPONENT, evaluation_start_time, evaluation_end_time)
 
     # plot_data_frames(kiln_data_df, ms4_out_df, start_time=start_time, end_time=end_time)
 

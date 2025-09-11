@@ -1,5 +1,9 @@
-How to use: 
--a is a flag to run more indepth analysis.
--r resets the data from athena if you update the dates or just want to update your data cache
--p plots the data in a bunch of different graphs.
+Repo of a bunch of stuff I worked on over my internship.
 
+Tag_comparison.py is a file that compares tags from acme-to for offline testing. You can see the differences of two tags at the same time stamps or plot the tags to see visually if they are behaving as you expect. It was pretty helpful for testing ACME stuff.
+
+All of the reducer amps work is in the folder called Current Spike. The current data folder holds my cached Athena Querries, the results folder holds coefficient and p values from various regression tests. The other files can be sorted into three categories - 1. Loading data from athena and preparing it for regression (amp loader or material trans loader are exmplaes of these types of files.) 2. Regression model files arrange the data and run the regression tests (amp_feed_coorelation is the main one of these). Or 3. Analyzing / plotting files to understand what our regression returned. The main ones of these are regression_analyzer for comparing coefficents and residuals plotter to find visual examples of where our data has trends.
+
+The kiln modelling can be found in the kiln modelling folder. There is some cached data in the data folder but the real meat of the program is in kiln model. Thus far I have a pretty good mathmatical kiln model based on weight and rpm and an evaluation and plotting function to see what the kiln model looks like on test data. The model improves as our time scale gets larger due to the bucketting of our ms4 output data.
+
+The last set of code is on feed rate controller comparison - it is kind of scattered through the home folder unfortunetly. Really the main file is feedrate_controller_comparison - which will query athena and then run analysis of various feed controls based on their over shoot, frequencey of fan spikes, and frequencey of high rate events (basically when the kiln weight has a high derivative ie spikes up.)
